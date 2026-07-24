@@ -1,5 +1,5 @@
 <p align="center">
-    <img alt="zrk console demo" src="./zrk.svg" width="600" />
+    <img alt="zrk console demo" src="./zrk.gif" width="600" />
 </p>
 
 # zrk
