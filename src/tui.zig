@@ -28,20 +28,22 @@ const spec_bins = 1024;
 const spec_width = 100;
 
 /// Heatmap intensity ramp for occupied cells (empty cells render as a space).
-/// The "Sodium" gradient: an all-amber incandescence with no gray floor — a dim
-/// amber (130) rises straight through the zoxy brand amber (214) to white-hot, so
-/// the whole ramp stays on-brand. Each stop pairs a 256-color SGR with a shade
-/// glyph so intensity survives `NO_COLOR` as 4 block densities.
+/// An "Inferno" gradient — the classic latency heatmap: faint cells recede as a
+/// deep purple, dense cells climb through magenta and orange to the brand amber
+/// (214) and a hot pale-yellow. Keeping the dark end saturated-cool is the whole
+/// point — a warm ramp goes muddy brown at low brightness, since brown *is* dark
+/// desaturated orange. Each stop pairs a 256-color SGR with a shade glyph so
+/// intensity survives `NO_COLOR` as 4 block densities.
 const HeatStop = struct { sgr: []const u8, glyph: []const u8 };
 const heat_ramp = [_]HeatStop{
-    .{ .sgr = "\x1b[38;5;130m", .glyph = "░" }, // trace   — dim amber
-    .{ .sgr = "\x1b[38;5;172m", .glyph = "░" }, //         — amber-brown
-    .{ .sgr = "\x1b[38;5;214m", .glyph = "▒" }, //         — amber (brand)
-    .{ .sgr = "\x1b[38;5;220m", .glyph = "▒" }, //         — gold
-    .{ .sgr = "\x1b[38;5;222m", .glyph = "▓" }, //         — light amber
-    .{ .sgr = "\x1b[38;5;228m", .glyph = "▓" }, //         — pale yellow
-    .{ .sgr = "\x1b[38;5;230m", .glyph = "█" }, //         — cream
-    .{ .sgr = "\x1b[38;5;231m", .glyph = "█" }, // hottest — white
+    .{ .sgr = "\x1b[38;5;53m", .glyph = "░" }, // trace   — deep purple
+    .{ .sgr = "\x1b[38;5;90m", .glyph = "░" }, //         — magenta
+    .{ .sgr = "\x1b[38;5;125m", .glyph = "▒" }, //         — pink-magenta
+    .{ .sgr = "\x1b[38;5;167m", .glyph = "▒" }, //         — red
+    .{ .sgr = "\x1b[38;5;202m", .glyph = "▓" }, //         — orange-red
+    .{ .sgr = "\x1b[38;5;208m", .glyph = "▓" }, //         — orange
+    .{ .sgr = "\x1b[38;5;214m", .glyph = "█" }, //         — amber (brand)
+    .{ .sgr = "\x1b[38;5;229m", .glyph = "█" }, // hottest — pale yellow
 };
 
 /// Column the live stats block indents to — a 6-wide label, a 9-wide right-
