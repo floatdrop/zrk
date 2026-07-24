@@ -17,13 +17,36 @@ const hdr = @import("hdr.zig");
 const connection = @import("connection.zig");
 const stats = @import("stats.zig");
 
-const spark = [_][]const u8{ "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
-const history_len = 60;
+/// Live latency spectrogram geometry. The waterfall keeps the last
+/// `spec_rows_max` per-interval distributions (newest at the bottom), each
+/// binned onto a fixed `spec_bins`-wide log2 latency axis so history stays
+/// aligned while the display auto-frames to the occupied range. The full height
+/// is reserved from the first frame (empty rows pad the top until it fills), and
+/// the heat is a fixed `spec_width` columns wide.
+const spec_rows_max = 10;
+const spec_bins = 1024;
+const spec_width = 100;
 
-/// Column at which the latency bars begin — a 6-wide label, a 9-wide right-
-/// aligned value, and a 2-space gap (see `barLine`). The live stats block is
-/// indented to this same column so the elapsed timer, which sits in the left
-/// gutter and widens as it counts up, never shifts the stats to the right.
+/// Heatmap intensity ramp for occupied cells (empty cells render as a space).
+/// The "Sodium" gradient: an all-amber incandescence with no gray floor — a dim
+/// amber (130) rises straight through the zoxy brand amber (214) to white-hot, so
+/// the whole ramp stays on-brand. Each stop pairs a 256-color SGR with a shade
+/// glyph so intensity survives `NO_COLOR` as 4 block densities.
+const HeatStop = struct { sgr: []const u8, glyph: []const u8 };
+const heat_ramp = [_]HeatStop{
+    .{ .sgr = "\x1b[38;5;130m", .glyph = "░" }, // trace   — dim amber
+    .{ .sgr = "\x1b[38;5;172m", .glyph = "░" }, //         — amber-brown
+    .{ .sgr = "\x1b[38;5;214m", .glyph = "▒" }, //         — amber (brand)
+    .{ .sgr = "\x1b[38;5;220m", .glyph = "▒" }, //         — gold
+    .{ .sgr = "\x1b[38;5;222m", .glyph = "▓" }, //         — light amber
+    .{ .sgr = "\x1b[38;5;228m", .glyph = "▓" }, //         — pale yellow
+    .{ .sgr = "\x1b[38;5;230m", .glyph = "█" }, //         — cream
+    .{ .sgr = "\x1b[38;5;231m", .glyph = "█" }, // hottest — white
+};
+
+/// Column the live stats block indents to — a 6-wide label, a 9-wide right-
+/// aligned value, and a 2-space gap — so the elapsed timer, which sits in the
+/// left gutter and widens as it counts up, never shifts the stats to the right.
 const stat_col: usize = 6 + 9 + 2;
 
 /// SGR fragments interpolated into every panel print. The disabled value is
@@ -76,11 +99,17 @@ pub const Dashboard = struct {
     samples: [rate_ring_len]Sample = undefined,
     sample_count: usize = 0,
 
-    // p99 history (microseconds) for the sparkline — one point per
-    // --interval, not per frame, so the scroll speed doesn't follow --refresh.
-    p99_hist: [history_len]u64 = [_]u64{0} ** history_len,
-    p99_count: usize = 0,
-    last_spark_ns: i128 = 0,
+    // Per-interval latency distributions for the spectrogram, advanced one row
+    // per --interval (not per --refresh, so scroll speed doesn't follow the
+    // redraw rate). Each row holds the interval's counts across `spec_bins` log2
+    // latency bins, isolated by diffing the cumulative snapshot against
+    // `spec_cum` (the cumulative bins at the previous row boundary). Both arrays
+    // start undefined: `spec_count`/`spec_have_cum` gate every read.
+    spec_rows: [spec_rows_max][spec_bins]u64 = undefined,
+    spec_cum: [spec_bins]u64 = undefined,
+    spec_count: usize = 0,
+    spec_have_cum: bool = false,
+    last_row_ns: i128 = 0,
 
     const Sample = struct { ns: i128, completed: u64, bytes: u64 };
     const rate_ring_len = 128;
@@ -147,11 +176,12 @@ pub const Dashboard = struct {
         };
         self.sample_count += 1;
 
-        const p99 = snap.hist.valueAtPercentile(99);
-        if (self.p99_count == 0 or now_ns - self.last_spark_ns >= self.cfg.interval_ns) {
-            self.p99_hist[self.p99_count % history_len] = p99;
-            self.p99_count += 1;
-            self.last_spark_ns = now_ns;
+        // Advance the spectrogram one row per --interval (independent of the
+        // faster --refresh redraw), diffing the cumulative snapshot to isolate
+        // this interval's latency distribution.
+        if (self.spec_count == 0 or now_ns - self.last_row_ns >= self.cfg.interval_ns) {
+            self.pushSpecRow(&snap.hist);
+            self.last_row_ns = now_ns;
         }
 
         if (self.tui) {
@@ -160,14 +190,14 @@ pub const Dashboard = struct {
             // that rewraps old lines can leave artifacts for one frame; the
             // next repaint absorbs them.)
             self.term_cols = termWidth(self.file);
-            if (self.prev_lines > 0) try w.print("\x1b[{d}F\x1b[J", .{self.prev_lines});
-            self.prev_lines = try self.drawPanel(w, snap, rate, bps, elapsed_s, total_s, p99);
+            if (self.prev_lines > 0) try w.print("\r\x1b[{d}A\x1b[J", .{self.prev_lines});
+            self.prev_lines = try self.drawPanel(w, snap, rate, bps, elapsed_s, total_s, false);
         } else {
             try w.print("[{d:6.1}s] {d:8.0} req/s {f}/s  p50={f} p99={f} p99.9={f} max={f}  errs={d}\n", .{
-                elapsed_s,               rate,
-                Bytes.of(bps),           Dur.of(snap.hist.valueAtPercentile(50)),
-                Dur.of(p99),             Dur.of(snap.hist.valueAtPercentile(99.9)),
-                Dur.of(snap.hist.max()), snap.counters.socketErrors() + snap.counters.status_errors + snap.counters.deadline_errors,
+                elapsed_s,                             rate,
+                Bytes.of(bps),                         Dur.of(snap.hist.valueAtPercentile(50)),
+                Dur.of(snap.hist.valueAtPercentile(99)), Dur.of(snap.hist.valueAtPercentile(99.9)),
+                Dur.of(snap.hist.max()),               snap.counters.socketErrors() + snap.counters.status_errors + snap.counters.deadline_errors,
             });
         }
         try self.fw.interface.flush();
@@ -184,7 +214,7 @@ pub const Dashboard = struct {
     /// the next frame knows how far to repaint. Config the launching command
     /// already shows (URL, -c, a ramp's A:B) is not repeated here — it sits
     /// right above in scrollback.
-    fn drawPanel(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, rate: f64, bps: f64, elapsed_s: f64, total_s: f64, p99: u64) !usize {
+    fn drawPanel(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, rate: f64, bps: f64, elapsed_s: f64, total_s: f64, finished: bool) !usize {
         const c = snap.counters;
         const k = self.colors;
         var lines: usize = 0;
@@ -222,12 +252,18 @@ pub const Dashboard = struct {
         // the second (its width wiggles as units climb); status-class counters
         // on the third.
         //
-        // A blinking red "recording" dot leads the clock. It toggles on a ~1s
-        // wall-clock phase (rather than the SGR blink attribute, which most
-        // terminals ignore); the cell stays one column wide — a space while
-        // dark — so the clock never jitters.
-        const blink_on = (@as(u64, @intFromFloat(@max(elapsed_s, 0) * 2)) & 1) == 0;
-        if (blink_on) try w.print("{s}●{s} ", .{ k.red, k.reset }) else try w.writeAll("  ");
+        // A blinking red "recording" dot leads the clock while the run is live;
+        // it toggles on a ~1s wall-clock phase (rather than the SGR blink
+        // attribute, which most terminals ignore), and the cell stays one column
+        // wide — a space while dark — so the clock never jitters. Once finished
+        // it settles to a static dim dot: the panel stays on screen as the run's
+        // record, and a still grey dot reads as "stopped", not "recording".
+        if (finished) {
+            try w.print("{s}●{s} ", .{ k.dim, k.reset });
+        } else {
+            const blink_on = (@as(u64, @intFromFloat(@max(elapsed_s, 0) * 2)) & 1) == 0;
+            if (blink_on) try w.print("{s}●{s} ", .{ k.red, k.reset }) else try w.writeAll("  ");
+        }
         try w.print("{s}{s} / {s}{s}", .{ v_time, k.dim, v_total, k.reset });
         const timer_w = 2 + v_time.len + 3 + v_total.len; // "● " + clock + " / "
         try padTo(w, @max(stat_col -| timer_w, 1));
@@ -269,6 +305,7 @@ pub const Dashboard = struct {
 
         const errs = c.socketErrors();
         if (errs > 0 or c.status_errors > 0) {
+            try padTo(w, stat_col);
             try w.print("{s}socket errors {d}   non-2xx/3xx {d}{s}\n", .{
                 k.red, errs, c.status_errors, k.reset,
             });
@@ -278,6 +315,7 @@ pub const Dashboard = struct {
         // gauge shows even when nothing has missed yet (a ramp approaching the
         // knee), so it's the earliest warning that the client is falling behind.
         if (c.deadline_errors > 0 or (self.cfg.deadline_ns != 0 and c.max_behind_ns > 0)) {
+            try padTo(w, stat_col);
             try w.print("{s}deadline misses {d}{s}   {s}peak lag{s} {f}\n", .{
                 k.red, c.deadline_errors, k.reset,
                 k.dim, k.reset,           Dur.of(c.max_behind_ns / std.time.ns_per_us),
@@ -287,46 +325,215 @@ pub const Dashboard = struct {
         try w.writeAll("\n");
         lines += 1;
 
-        // --- latency spectrum (labels say it: p50…p99.9, CO-corrected) -------
-        const rows = [_]struct { label: []const u8, v: u64, slo: bool = false }{
-            .{ .label = "p50", .v = snap.hist.valueAtPercentile(50) },
-            .{ .label = "p75", .v = snap.hist.valueAtPercentile(75) },
-            .{ .label = "p90", .v = snap.hist.valueAtPercentile(90) },
-            .{ .label = "p99", .v = p99, .slo = true },
-            .{ .label = "p99.9", .v = snap.hist.valueAtPercentile(99.9) },
-            .{ .label = "max", .v = snap.hist.max() },
+        // --- latency: a compact percentile readout, then the spectrogram ------
+        // The bars are gone (issue #34): the spectrogram below shows the whole
+        // evolving distribution — including bimodality the bars hid — while this
+        // one line keeps the exact numbers the shape can't give, and carries the
+        // live SLO signal (p99 turns red past --slo-p99).
+        const p99 = snap.hist.valueAtPercentile(99);
+        const alarm = self.cfg.slo_p99_ns != null and
+            p99 * std.time.ns_per_us > self.cfg.slo_p99_ns.?;
+        // Ascending display order; `keep` is the drop priority (lower survives a
+        // narrow terminal longer). p50/p99/max are the load-test essentials, so
+        // when the line won't fit we shed the middle markers first — p99.9, then
+        // p75, then p90 — never the tail (max) or p99.
+        const Pctl = struct { label: []const u8, v: u64, keep: u8, alarm: bool = false };
+        const pctls = [_]Pctl{
+            .{ .label = "p50", .v = snap.hist.valueAtPercentile(50), .keep = 0 },
+            .{ .label = "p75", .v = snap.hist.valueAtPercentile(75), .keep = 4 },
+            .{ .label = "p90", .v = snap.hist.valueAtPercentile(90), .keep = 3 },
+            .{ .label = "p99", .v = p99, .keep = 1, .alarm = alarm },
+            .{ .label = "p99.9", .v = snap.hist.valueAtPercentile(99.9), .keep = 5 },
+            .{ .label = "max", .v = snap.hist.max(), .keep = 2 },
         };
-        // Log scale from p50/2 up to max: latency spans decades, and a linear
-        // bar crushes everything but the tail. Anchoring at p50 keeps healthy
-        // spectra readable at any absolute latency (LAN µs or WAN seconds).
-        const lo: f64 = @floatFromInt(@max(rows[0].v / 2, 1));
-        const hi: f64 = @max(@as(f64, @floatFromInt(rows[rows.len - 1].v)), lo * 8);
-        const bar_w: usize = @min(@max(self.term_cols -| 19, 10), 44);
-        for (rows) |row| {
-            // Live SLO signal: the gated p99 row turns red past --slo-p99.
-            const alarm = row.slo and self.cfg.slo_p99_ns != null and
-                row.v * std.time.ns_per_us > self.cfg.slo_p99_ns.?;
-            try self.barLine(w, row.label, row.v, lo, hi, bar_w, alarm);
+        var valbuf: [pctls.len][16]u8 = undefined;
+        var vals: [pctls.len][]const u8 = undefined;
+        for (pctls, 0..) |pc, i| vals[i] = std.fmt.bufPrint(&valbuf[i], "{f}", .{Dur.of(pc.v)}) catch "?";
+
+        // Select which fit by ascending `keep` priority (visible width = label +
+        // space + value; color codes add no columns; segments joined by 3 spaces),
+        // then render the survivors in display order so the line never wraps.
+        var show = [_]bool{false} ** pctls.len;
+        var used: usize = 0;
+        var shown: usize = 0;
+        for (0..pctls.len) |prio| {
+            const i = for (pctls, 0..) |pc, j| {
+                if (pc.keep == prio) break j;
+            } else continue;
+            const seg = pctls[i].label.len + 1 + vals[i].len;
+            const sep: usize = if (shown == 0) 0 else 3;
+            if (used + sep + seg > self.term_cols -| 1) continue; // last column stays free (autowrap)
+            show[i] = true;
+            used += sep + seg;
+            shown += 1;
+        }
+        var first = true;
+        for (pctls, 0..) |pc, i| {
+            if (!show[i]) continue;
+            if (!first) try w.writeAll("   ");
+            first = false;
+            try w.print("{s}{s}{s} {s}{s}{s}", .{
+                k.dim, pc.label, k.reset, if (pc.alarm) k.red else "", vals[i], k.reset,
+            });
+        }
+        try w.writeAll("\n");
+        lines += 1;
+
+        lines += try self.drawSpectrogram(w, snap.hist.highest_trackable);
+
+        return lines;
+    }
+
+    /// Fold the cumulative snapshot onto the fixed log2 axis and store this
+    /// interval's slice (current cumulative − previous cumulative) as the newest
+    /// spectrogram row.
+    fn pushSpecRow(self: *Dashboard, hist: *const hdr.Histogram) void {
+        var cur: [spec_bins]u64 = undefined;
+        hist.binByLog2(&cur);
+        if (!self.spec_have_cum) {
+            @memset(&self.spec_cum, 0);
+            self.spec_have_cum = true;
+        }
+        const idx = self.spec_count % spec_rows_max;
+        for (&self.spec_rows[idx], &cur, &self.spec_cum) |*d, c, p| d.* = c -| p;
+        @memcpy(&self.spec_cum, &cur);
+        self.spec_count += 1;
+    }
+
+    /// The visible row at position `r` (0 = oldest of the `n` shown) in the ring.
+    fn rowAt(self: *const Dashboard, r: usize, n: usize) []const u64 {
+        return &self.spec_rows[(self.spec_count - n + r) % spec_rows_max];
+    }
+
+    /// Draw the latency spectrogram: a fixed `spec_rows_max`-tall, `spec_width`-
+    /// wide heat-shaded waterfall of the per-interval distributions (newest at
+    /// the bottom, next to the scale), auto-framed to the occupied latency range.
+    /// The full height is reserved from the first frame — rows not yet recorded
+    /// render empty at the top — so the panel never grows. `axis_highest` is the
+    /// histogram's ceiling (µs), fixing the log2 axis the rows were binned on.
+    /// Always writes `spec_rows_max + 1` lines (rows + scale); returns that count.
+    fn drawSpectrogram(self: *Dashboard, w: *Io.Writer, axis_highest: u64) !usize {
+        const k = self.colors;
+        const n = @min(self.spec_count, spec_rows_max); // rows with real data
+
+        // Auto-frame: the occupied storage-bin span across the recorded rows.
+        var minb: usize = spec_bins;
+        var maxb: usize = 0;
+        for (0..n) |r| {
+            for (self.rowAt(r, n), 0..) |cnt, b| if (cnt > 0) {
+                if (b < minb) minb = b;
+                if (b > maxb) maxb = b;
+            };
+        }
+        const have_data = minb <= maxb;
+
+        // Pad a narrow distribution out to a minimum span so it isn't a lone
+        // stripe, keeping the span within [0, spec_bins).
+        const min_span = 24;
+        if (have_data and maxb - minb + 1 < min_span) {
+            const grow = min_span - (maxb - minb + 1);
+            minb -|= grow / 2;
+            maxb = @min(maxb + (grow - grow / 2), spec_bins - 1);
+        }
+        const span = if (have_data) maxb - minb + 1 else 1;
+
+        // Render width prefers the fixed spec_width but clamps to the terminal,
+        // leaving the last column free: a row exactly `term_cols` wide triggers
+        // last-column autowrap, which adds a phantom line and desyncs the in-place
+        // repaint. Storage/render buffers stay sized to the spec_width maximum.
+        const width = @max(@min(spec_width, self.term_cols -| 1), 1);
+
+        // Aggregate each row's storage bins into `width` display columns,
+        // tracking the global peak for a log-compressed intensity scale (so a
+        // smaller mode still shows rather than washing out next to the dominant
+        // one). Empty ring slots (before the waterfall fills) stay all-zero.
+        var cells: [spec_rows_max][spec_width]u64 = std.mem.zeroes([spec_rows_max][spec_width]u64);
+        var peak: u64 = 1;
+        if (have_data) {
+            for (0..n) |r| {
+                const row = self.rowAt(r, n);
+                for (0..width) |x| {
+                    const lo = minb + x * span / width;
+                    // Advance at least one bin per column so upsampling a narrow
+                    // span leaves no artificial gaps; real gaps between modes
+                    // (empty bins) still read as empty columns.
+                    const hi = @max(lo + 1, minb + (x + 1) * span / width);
+                    var sum: u64 = 0;
+                    var b = lo;
+                    while (b < hi and b <= maxb) : (b += 1) sum += row[b];
+                    // Newest data sits on the bottom rows; older rows pad the top.
+                    cells[spec_rows_max - n + r][x] = sum;
+                    if (sum > peak) peak = sum;
+                }
+            }
+        }
+        const denom = std.math.log2(@as(f64, @floatFromInt(1 + peak)));
+        const color_on = k.reset.len > 0; // theme active (TTY and not NO_COLOR)
+        const hottest = heat_ramp.len - 1;
+
+        var lines: usize = 0;
+        for (0..spec_rows_max) |r| {
+            for (0..width) |x| {
+                const q = cells[r][x];
+                if (q == 0) {
+                    try w.writeAll(" ");
+                    continue;
+                }
+                const frac: f64 = if (denom > 0)
+                    std.math.clamp(std.math.log2(@as(f64, @floatFromInt(1 + q))) / denom, 0.0, 1.0)
+                else
+                    1.0;
+                const stop = heat_ramp[@intFromFloat(@round(frac * @as(f64, @floatFromInt(hottest))))];
+                if (color_on) {
+                    try w.print("{s}{s}{s}", .{ stop.sgr, stop.glyph, k.reset });
+                } else {
+                    try w.writeAll(stop.glyph);
+                }
+            }
+            try w.writeAll("\n");
             lines += 1;
         }
 
-        try w.writeAll("\n");
+        try self.drawSpecScale(w, axis_highest, minb, span, width, have_data);
         lines += 1;
-        // p99-over-time trend: the sparkline starts right after the `p99 ` label
-        // (4 columns) and runs to the bars' right edge (`stat_col + bar_w`), so
-        // it ends where the spectrum above ends; the current-p99 readout then
-        // follows just past it. The width is capped so a wide readout can't push
-        // the line off the terminal edge (which would wrap and desync the
-        // repaint line count).
-        var pbuf: [16]u8 = undefined;
-        const pval = std.fmt.bufPrint(&pbuf, "{f}", .{Dur.of(p99)}) catch "?";
-        const spark_w = @min(stat_col + bar_w - 4, self.term_cols -| (pval.len + 5));
-        try w.print("{s}p99{s} {s}", .{ k.dim, k.reset, k.amber_hi });
-        try self.drawSparkline(w, spark_w);
-        try w.print("{s} {s}{s}{s}\n", .{ k.reset, k.dim, pval, k.reset });
-        lines += 1;
-
         return lines;
+    }
+
+    /// The latency scale under the spectrogram: up to four log-spaced tick
+    /// labels placed at their columns without overlapping.
+    fn drawSpecScale(self: *Dashboard, w: *Io.Writer, axis_highest: u64, minb: usize, span: usize, width: usize, have_data: bool) !void {
+        const k = self.colors;
+        var buf: [spec_width]u8 = undefined;
+        @memset(buf[0..width], ' ');
+        // Before any data lands there is no range to label — keep the line (so
+        // the height stays fixed) but blank.
+        if (have_data) {
+            // Left/middle ticks are anchored at their column; the final tick (the
+            // top of the range) is right-aligned to the last column so the max
+            // latency is always labeled.
+            const label = struct {
+                fn at(hi: u64, minbb: usize, spann: usize, widthh: usize, col: usize, out: []u8) []const u8 {
+                    const b = minbb + col * spann / widthh;
+                    var ls: Io.Writer = .fixed(out);
+                    Dur.write(&ls, specBinEdgeUs(hi, b)) catch return "";
+                    return ls.buffered();
+                }
+            }.at;
+            var lbuf: [12]u8 = undefined;
+            var next_free: usize = 0;
+            for ([_]usize{ 0, width / 3, (2 * width) / 3 }) |tx| {
+                const s = label(axis_highest, minb, span, width, tx, &lbuf);
+                if (tx >= next_free and tx + s.len <= width) {
+                    @memcpy(buf[tx .. tx + s.len], s);
+                    next_free = tx + s.len + 1;
+                }
+            }
+            const top = label(axis_highest, minb, span, width, width - 1, &lbuf);
+            if (top.len <= width and width - top.len >= next_free) {
+                @memcpy(buf[width - top.len .. width], top);
+            }
+        }
+        try w.print("{s}{s}{s}\n", .{ k.dim, buf[0..width], k.reset });
     }
 
     fn segLine(self: *Dashboard, w: *Io.Writer, segs: []const Seg) !void {
@@ -341,73 +548,30 @@ pub const Dashboard = struct {
         try w.writeAll("\n");
     }
 
-    /// `p99      8.91ms  ━━━━━━━━╾·····` — flush left, value right-aligned,
-    /// bar on a log scale between lo..hi, half-cell precision, dim dots
-    /// for the rest.
-    fn barLine(self: *Dashboard, w: *Io.Writer, label: []const u8, micros: u64, lo: f64, hi: f64, bar_w: usize, alarm: bool) !void {
-        const k = self.colors;
-        var dbuf: [16]u8 = undefined;
-        const val = std.fmt.bufPrint(&dbuf, "{f}", .{Dur.of(micros)}) catch "?";
-        // label(6) + value(9) + gap(2) — their sum is `stat_col`, which the
-        // live stats block indents to so it aligns with where the bars begin.
-        try w.print("{s}{s:<6}{s}{s}{s:>9}{s}  ", .{
-            k.dim, label, k.reset, if (alarm) k.red else "", val, k.reset,
-        });
-
-        const v: f64 = @floatFromInt(@max(micros, 1));
-        const frac: f64 = if (hi > lo and v > lo)
-            @min(@log(v / lo) / @log(hi / lo), 1.0)
-        else
-            0;
-        const cells2: usize = @intFromFloat(@round(frac * @as(f64, @floatFromInt(bar_w)) * 2));
-        const whole = cells2 / 2;
-        const half = cells2 % 2 == 1;
-
-        try w.writeAll(if (alarm) k.red else k.amber);
-        var i: usize = 0;
-        while (i < whole) : (i += 1) try w.writeAll("━");
-        if (half) try w.writeAll("╾");
-        try w.writeAll(k.reset);
-
-        try w.writeAll(k.dim);
-        var rest = bar_w - whole - @intFromBool(half);
-        while (rest > 0) : (rest -= 1) try w.writeAll("·");
-        try w.print("{s}\n", .{k.reset});
-    }
-
     fn line(_: *Dashboard, w: *Io.Writer, label: []const u8, micros: u64) !void {
         try w.print("    {s:<7}", .{label});
         try Dur.write(w, @floatFromInt(micros));
         try w.writeAll("\n");
     }
 
-    fn drawSparkline(self: *Dashboard, w: *Io.Writer, max_cols: usize) !void {
-        const n = @min(@min(self.p99_count, history_len), @max(max_cols, 8));
-        if (n == 0) return;
-
-        // Find max over the visible window to scale the bars.
-        var max_v: u64 = 1;
-        {
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                const v = self.p99_hist[(self.p99_count - n + i) % history_len];
-                if (v > max_v) max_v = v;
-            }
-        }
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const v = self.p99_hist[(self.p99_count - n + i) % history_len];
-            const idx = (v * (spark.len - 1)) / max_v;
-            try w.writeAll(spark[@min(idx, spark.len - 1)]);
-        }
-    }
-
-    /// Print the wrk2-style final report to stdout. Aggregates should come
-    /// from `Fleet.readFinal` (post-join). The report replaces the live panel
-    /// in place — the launching command and anything above stay in scrollback.
+    /// Emit the final report. With a live TUI the panel *is* the report: the last
+    /// frame is repainted with the complete totals and a settled (non-blinking)
+    /// dot, then left on screen as the run's record — no separate summary. Without
+    /// a TUI (--plain, a pipe, non-tty) a compact plain-text summary is printed
+    /// instead. Aggregates should come from `Fleet.readFinal` (post-join).
     pub fn final(self: *Dashboard, snap: *const stats.Snapshot, elapsed_s: f64) !void {
-        try self.erasePanel();
-        try self.writeReport(self.writer(), snap, elapsed_s);
+        const w = self.writer();
+        if (self.tui) {
+            const c = snap.counters;
+            const rate: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.completed)) / elapsed_s else 0;
+            const bps: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.bytes)) / elapsed_s else 0;
+            const total_s: f64 = @as(f64, @floatFromInt(self.cfg.duration_ns)) / std.time.ns_per_s;
+            self.term_cols = termWidth(self.file);
+            if (self.prev_lines > 0) try w.print("\r\x1b[{d}A\x1b[J", .{self.prev_lines});
+            self.prev_lines = try self.drawPanel(w, snap, rate, bps, elapsed_s, total_s, true);
+        } else {
+            try self.writeFinalSummary(w, snap, elapsed_s);
+        }
         try self.fw.interface.flush();
     }
 
@@ -422,66 +586,54 @@ pub const Dashboard = struct {
 
     fn erasePanel(self: *Dashboard) !void {
         if (self.tui and self.prev_lines > 0) {
-            try self.writer().print("\x1b[{d}F\x1b[J", .{self.prev_lines});
+            try self.writer().print("\r\x1b[{d}A\x1b[J", .{self.prev_lines});
             self.prev_lines = 0;
         }
     }
 
-    /// Render the wrk2-style final report to any writer (stdout, or the
-    /// `--output` file in text mode). Does not flush.
-    pub fn writeReport(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, elapsed_s: f64) !void {
+    /// Compact plain-text final summary for non-TUI output (--plain, a pipe, or
+    /// the `--output` file). No colors and no wrk2-style framing — just the totals
+    /// the live panel would have shown, in the panel's own vocabulary. Does not
+    /// flush. Aggregates should come from `Fleet.readFinal` (post-join).
+    pub fn writeFinalSummary(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, elapsed_s: f64) !void {
         const c = snap.counters;
         const rps: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.completed)) / elapsed_s else 0;
         const bps: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.bytes)) / elapsed_s else 0;
 
-        try w.print("\nRunning {d:.0}s test @ {s}://{s}:{d}{s}\n", .{
-            elapsed_s, @tagName(self.cfg.url.scheme), self.cfg.url.host, self.cfg.url.port, self.cfg.url.target,
-        });
-        // A ramp is reported as its full range — neither endpoint alone
-        // describes what was offered.
-        if (self.cfg.rate_end) |e| {
-            try w.print("  {d} connections, target rate {d}→{d} req/s\n\n", .{ self.cfg.connections, self.cfg.rate, e });
-        } else {
-            try w.print("  {d} connections, target rate {d} req/s\n\n", .{ self.cfg.connections, self.cfg.rate });
-        }
-
-        try w.writeAll("  Latency (corrected for coordinated omission)\n");
-        try self.line(w, "50%", snap.hist.valueAtPercentile(50));
-        try self.line(w, "75%", snap.hist.valueAtPercentile(75));
-        try self.line(w, "90%", snap.hist.valueAtPercentile(90));
-        try self.line(w, "99%", snap.hist.valueAtPercentile(99));
-        try self.line(w, "99.9%", snap.hist.valueAtPercentile(99.9));
-        try self.line(w, "99.99%", snap.hist.valueAtPercentile(99.99));
-        try self.line(w, "max", snap.hist.max());
-
-        if (self.cfg.latency) try self.fullSpectrum(w, &snap.hist);
-
         try w.print("\n  {d} requests in {d:.2}s, ", .{ c.completed, elapsed_s });
         try writeBytes(w, @floatFromInt(c.bytes));
-        try w.writeAll(" read\n");
-        if (c.status_errors > 0) try w.print("  Non-2xx or 3xx responses: {d}\n", .{c.status_errors});
+        try w.print(" read  ·  {d:.0} req/s  ·  ", .{rps});
+        try writeBytes(w, bps);
+        try w.writeAll("/s\n");
+
+        try w.writeAll("  latency (coordinated-omission corrected)\n");
+        try self.line(w, "p50", snap.hist.valueAtPercentile(50));
+        try self.line(w, "p75", snap.hist.valueAtPercentile(75));
+        try self.line(w, "p90", snap.hist.valueAtPercentile(90));
+        try self.line(w, "p99", snap.hist.valueAtPercentile(99));
+        try self.line(w, "p99.9", snap.hist.valueAtPercentile(99.9));
+        try self.line(w, "max", snap.hist.max());
+        if (self.cfg.latency) try self.fullSpectrum(w, &snap.hist);
+
+        if (c.status_errors > 0) try w.print("  non-2xx/3xx: {d}\n", .{c.status_errors});
         if (c.status_class[3] > 0) {
-            try w.print("  3xx (redirect) responses: {d} — redirects are not followed\n", .{c.status_class[3]});
+            try w.print("  3xx (redirect): {d} — redirects are not followed\n", .{c.status_class[3]});
         }
         if (c.socketErrors() > 0) {
-            try w.print("  Socket errors: connect {d}, read {d}, write {d}, timeout {d}\n", .{
+            try w.print("  socket errors: connect {d}, read {d}, write {d}, timeout {d}\n", .{
                 c.connect_errors, c.read_errors, c.write_errors, c.timeouts,
             });
         }
         if (c.deadline_errors > 0) {
-            try w.print("  Deadline misses: {d} (CO latency exceeded --deadline)\n", .{c.deadline_errors});
+            try w.print("  deadline misses: {d} (CO latency exceeded --deadline)\n", .{c.deadline_errors});
         }
         // Peak schedule lag is the backlog gauge; sub-millisecond lag is normal
         // jitter, so only report it once it's large enough to signal overload.
         if (c.max_behind_ns >= std.time.ns_per_ms) {
-            try w.writeAll("  Peak schedule lag: ");
+            try w.writeAll("  peak schedule lag: ");
             try Dur.write(w, @floatFromInt(c.max_behind_ns / std.time.ns_per_us));
             try w.writeAll("\n");
         }
-        try w.print("Requests/sec: {d:.2}\n", .{rps});
-        try w.writeAll("Transfer/sec: ");
-        try writeBytes(w, bps);
-        try w.writeAll("\n");
     }
 
     /// The `--latency` detailed percentile spectrum.
@@ -501,6 +653,15 @@ pub const Dashboard = struct {
 fn padTo(w: *Io.Writer, n: usize) !void {
     var i: usize = 0;
     while (i < n) : (i += 1) try w.writeAll(" ");
+}
+
+/// Latency (µs) at the lower edge of log2 bin `b`, mirroring `hdr.binByLog2`
+/// (`spec_bins` bins tiling `[1, axis_highest]`) — the inverse used to label
+/// the scale.
+fn specBinEdgeUs(axis_highest: u64, b: usize) f64 {
+    const span = std.math.log2(@as(f64, @floatFromInt(axis_highest)));
+    const frac = @as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(spec_bins));
+    return std.math.pow(f64, 2, frac * span);
 }
 
 /// Format a duration in seconds as `M:SS` — minutes uncapped, seconds
@@ -574,7 +735,7 @@ fn writeBytes(w: *Io.Writer, bytes: f64) !void {
 const testing = std.testing;
 const zio = @import("zio");
 
-test "writeReport renders the wrk2-style summary to any writer" {
+test "writeFinalSummary renders the compact plain summary to any writer" {
     var rt = try zio.Runtime.init(testing.allocator, .{});
     defer rt.deinit();
     const io = rt.io();
@@ -592,20 +753,132 @@ test "writeReport renders the wrk2-style summary to any writer" {
 
     var out = Io.Writer.Allocating.init(testing.allocator);
     defer out.deinit();
-    try dash.writeReport(&out.writer, &snap, 2.0);
+    try dash.writeFinalSummary(&out.writer, &snap, 2.0);
     const text = out.written();
 
-    try testing.expect(std.mem.indexOf(u8, text, "Latency (corrected for coordinated omission)") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "latency (coordinated-omission corrected)") != null);
     try testing.expect(std.mem.indexOf(u8, text, "100 requests in 2.00s") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "Requests/sec: 50.00") != null);
-    // No terminal control sequences in the redirectable report.
+    try testing.expect(std.mem.indexOf(u8, text, "50 req/s") != null);
+    // No wrk2-style framing survives.
+    try testing.expect(std.mem.indexOf(u8, text, "Requests/sec:") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "Running") == null);
+    // No terminal control sequences in the redirectable summary.
     try testing.expect(std.mem.indexOf(u8, text, "\x1b") == null);
     // No deadline mode here, so neither overload line appears.
-    try testing.expect(std.mem.indexOf(u8, text, "Deadline misses") == null);
-    try testing.expect(std.mem.indexOf(u8, text, "Peak schedule lag") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "deadline misses") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "peak schedule lag") == null);
 }
 
-test "writeReport surfaces deadline misses and peak schedule lag" {
+test "spectrogram renders a bimodal interval as two separated clusters" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const cfg = cli.Config{ .url = try cli.parseUrl("http://127.0.0.1/"), .interval_ns = std.time.ns_per_s };
+    var dash_buf: [64]u8 = undefined;
+    var dash = Dashboard.init(io, &cfg, .empty, &dash_buf);
+    dash.colors = .{}; // disabled: cells are glyph-or-space with no SGR to parse
+    dash.term_cols = 80;
+
+    // A bimodal cumulative snapshot: a ~0.5ms mode and a ~500ms mode, three
+    // decades apart.
+    var h = try stats.newHistogram(testing.allocator);
+    defer h.deinit();
+    var i: usize = 0;
+    while (i < 400) : (i += 1) h.record(500);
+    while (i < 600) : (i += 1) h.record(500_000);
+    dash.pushSpecRow(&h);
+
+    var out = Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+    const lines = try dash.drawSpectrogram(&out.writer, h.highest_trackable);
+    const text = out.written();
+
+    // Fixed height from the first frame: spec_rows_max rows + the scale line.
+    try testing.expectEqual(@as(usize, spec_rows_max + 1), lines);
+    // The scale carries latency labels spanning the two modes.
+    try testing.expect(std.mem.indexOf(u8, text, "us") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "ms") != null);
+
+    // The single data row is the last one (newest sits at the bottom); the rows
+    // above it are empty padding. Bimodality: that row has two heat clusters with
+    // a gap. Heat glyphs are 3-byte UTF-8 (lead byte 0xE2); an empty cell is a
+    // space (0x20). Find a 0xE2 … 0x20 … 0xE2 pattern within it.
+    var it = std.mem.splitScalar(u8, text, '\n');
+    var data_row: []const u8 = "";
+    while (it.next()) |ln| {
+        if (std.mem.indexOfScalar(u8, ln, 0xE2) != null) data_row = ln;
+    }
+    const g1 = std.mem.indexOfScalar(u8, data_row, 0xE2) orelse return error.NoGlyph;
+    const gap = std.mem.indexOfScalarPos(u8, data_row, g1, ' ') orelse return error.NoGap;
+    try testing.expect(std.mem.indexOfScalarPos(u8, data_row, gap, 0xE2) != null);
+}
+
+test "spectrogram reserves full height even before any data" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const cfg = cli.Config{ .url = try cli.parseUrl("http://127.0.0.1/") };
+    var dash_buf: [64]u8 = undefined;
+    var dash = Dashboard.init(io, &cfg, .empty, &dash_buf);
+    dash.colors = .{};
+    dash.term_cols = 120; // wider than spec_width, so the full 100 columns render
+
+    var out = Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+
+    // No rows pushed yet: the full height is still reserved (empty rows + a
+    // blank scale), so the panel never grows once data arrives.
+    try testing.expectEqual(@as(usize, spec_rows_max + 1), try dash.drawSpectrogram(&out.writer, stats.hist_highest));
+    // Every rendered row is exactly spec_width columns (no glyphs, all spaces).
+    var it = std.mem.splitScalar(u8, out.written(), '\n');
+    var rows: usize = 0;
+    while (it.next()) |ln| {
+        if (ln.len == 0) continue;
+        rows += 1;
+        try testing.expectEqual(@as(usize, spec_width), ln.len);
+        try testing.expect(std.mem.indexOfScalar(u8, ln, 0xE2) == null);
+    }
+    try testing.expectEqual(@as(usize, spec_rows_max + 1), rows);
+}
+
+test "spectrogram clamps its width to a narrow terminal (no wrap)" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const cfg = cli.Config{ .url = try cli.parseUrl("http://127.0.0.1/") };
+    var dash_buf: [64]u8 = undefined;
+    var dash = Dashboard.init(io, &cfg, .empty, &dash_buf);
+    dash.colors = .{};
+    dash.term_cols = 40; // narrower than spec_width
+
+    var h = try stats.newHistogram(testing.allocator);
+    defer h.deinit();
+    h.record(1000);
+    dash.pushSpecRow(&h);
+
+    var out = Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+    _ = try dash.drawSpectrogram(&out.writer, h.highest_trackable);
+    // No row exceeds the terminal width, so nothing wraps and desyncs the repaint.
+    var it = std.mem.splitScalar(u8, out.written(), '\n');
+    while (it.next()) |ln| {
+        if (ln.len == 0) continue;
+        // Bytes may exceed columns (multibyte glyphs), so count display columns:
+        // ASCII/space = 1 col, each 3-byte block glyph = 1 col.
+        var cols: usize = 0;
+        var bi: usize = 0;
+        while (bi < ln.len) {
+            if (ln[bi] & 0x80 == 0) bi += 1 else bi += 3;
+            cols += 1;
+        }
+        try testing.expect(cols <= dash.term_cols);
+    }
+}
+
+test "writeFinalSummary surfaces deadline misses and peak schedule lag" {
     var rt = try zio.Runtime.init(testing.allocator, .{});
     defer rt.deinit();
     const io = rt.io();
@@ -624,9 +897,9 @@ test "writeReport surfaces deadline misses and peak schedule lag" {
 
     var out = Io.Writer.Allocating.init(testing.allocator);
     defer out.deinit();
-    try dash.writeReport(&out.writer, &snap, 2.0);
+    try dash.writeFinalSummary(&out.writer, &snap, 2.0);
     const text = out.written();
 
-    try testing.expect(std.mem.indexOf(u8, text, "Deadline misses: 42") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "Peak schedule lag: 250.00ms") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "deadline misses: 42") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "peak schedule lag: 250.00ms") != null);
 }

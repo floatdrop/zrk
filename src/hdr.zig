@@ -357,6 +357,40 @@ pub const Histogram = struct {
         return self.lowestEquivalentValue(a) == self.lowestEquivalentValue(b);
     }
 
+    /// Fold the recorded counts into `out.len` equal-width log2 latency bins that
+    /// tile `[1, highest_trackable]`, so a caller (the live spectrogram) can render
+    /// a fixed-axis heatmap column without touching the bucket layout. `out` is
+    /// zeroed first; a value `v` maps to bin `floor(log2(v)/log2(highest)·out.len)`,
+    /// clamped to the last bin. Inverse of `log2BinEdge`. Total count is conserved.
+    pub fn binByLog2(self: *const Histogram, out: []u64) void {
+        @memset(out, 0);
+        if (out.len == 0) return;
+        const span = std.math.log2(@as(f64, @floatFromInt(self.highest_trackable)));
+        if (span <= 0) return;
+        const scale = @as(f64, @floatFromInt(out.len)) / span;
+        const s = self.touchedSpan() orelse return;
+        var i: u32 = s.lo;
+        while (i <= s.hi) : (i += 1) {
+            const cnt = self.counts[i];
+            if (cnt == 0) continue;
+            const v = self.medianEquivalentValue(self.valueFromIndex(i));
+            const l2 = std.math.log2(@as(f64, @floatFromInt(@max(v, 1))));
+            var b: usize = @intFromFloat(l2 * scale);
+            if (b >= out.len) b = out.len - 1;
+            out[b] += cnt;
+        }
+    }
+
+    /// Lower latency edge (µs) of log2 bin `b` of `nbins` tiling
+    /// `[1, highest_trackable]` — the inverse of the mapping in `binByLog2`,
+    /// used to label the spectrogram's latency scale.
+    pub fn log2BinEdge(self: *const Histogram, nbins: usize, b: usize) u64 {
+        if (nbins == 0) return self.lowest_discernible;
+        const span = std.math.log2(@as(f64, @floatFromInt(self.highest_trackable)));
+        const frac = @as(f64, @floatFromInt(b)) / @as(f64, @floatFromInt(nbins));
+        return @intFromFloat(@round(std.math.pow(f64, 2, frac * span)));
+    }
+
     // --- export --------------------------------------------------------------
 
     /// Write the classic HdrHistogram percentile distribution (`.hgrm`) — the
@@ -1012,6 +1046,54 @@ test "empty histogram queries are zero" {
     try testing.expectEqual(@as(u64, 0), h.max());
     try testing.expectEqual(@as(f64, 0), h.mean());
     try testing.expectEqual(@as(u64, 0), h.valueAtPercentile(99.0));
+}
+
+test "binByLog2 conserves count and separates two modes into ordered bins" {
+    var h = try newDefault();
+    defer h.deinit();
+    h.recordCount(100, 5); // ~100µs cluster
+    h.recordCount(100_000, 7); // ~100ms cluster, ~10 octaves higher
+
+    var bins: [512]u64 = undefined;
+    h.binByLog2(&bins);
+
+    // Count is conserved across the fold.
+    var total: u64 = 0;
+    for (bins) |b| total += b;
+    try testing.expectEqual(@as(u64, 12), total);
+
+    // Exactly two occupied bins, low mode strictly before the high mode.
+    var lo: ?usize = null;
+    var hi: ?usize = null;
+    var occupied: usize = 0;
+    for (bins, 0..) |b, i| if (b > 0) {
+        if (lo == null) lo = i;
+        hi = i;
+        occupied += 1;
+    };
+    try testing.expectEqual(@as(usize, 2), occupied);
+    try testing.expect(lo.? < hi.?);
+    try testing.expectEqual(@as(u64, 5), bins[lo.?]);
+    try testing.expectEqual(@as(u64, 7), bins[hi.?]);
+
+    // Each mode's value falls within its bin's [edge(b), edge(b+1)) latency range.
+    try testing.expect(h.log2BinEdge(512, lo.?) <= 100 and 100 < h.log2BinEdge(512, lo.? + 1));
+    try testing.expect(h.log2BinEdge(512, hi.?) <= 100_000 and 100_000 < h.log2BinEdge(512, hi.? + 1));
+}
+
+test "log2BinEdge is monotonic and spans the configured range" {
+    var h = try newDefault();
+    defer h.deinit();
+    var prev: u64 = 0;
+    var b: usize = 0;
+    while (b <= 512) : (b += 1) {
+        const e = h.log2BinEdge(512, b);
+        try testing.expect(e >= prev);
+        prev = e;
+    }
+    try testing.expectEqual(@as(u64, 1), h.log2BinEdge(512, 0)); // 2^0 = 1µs
+    // Top edge reaches the trackable ceiling (1h in µs).
+    try testing.expect(h.log2BinEdge(512, 512) >= 3_600_000_000);
 }
 
 test "mean of constant distribution" {

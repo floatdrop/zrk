@@ -116,7 +116,7 @@ fn writeTextReport(io: Io, dash: *tui.Dashboard, path: []const u8, snap: *const 
     defer file.close(io);
     var buf: [8192]u8 = undefined;
     var fw: Io.File.Writer = .init(file, io, &buf);
-    try dash.writeReport(&fw.interface, snap, elapsed_s);
+    try dash.writeFinalSummary(&fw.interface, snap, elapsed_s);
     try fw.interface.flush();
 }
 
