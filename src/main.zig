@@ -81,16 +81,17 @@ pub fn main(init: std.process.Init) !void {
     // and headless runs stay on the --interval stats window.
     const frame_ns: u64 = if (progress.dash != null and dash.tui) cfg.refresh_ns else 0;
 
-    // Ctrl-C stops the run and still reports what was measured — a long run
-    // interrupted near its end otherwise threw all of it away. The watcher sets
-    // a flag the runner polls rather than canceling it: cancellation discards
-    // the measurement, which is the opposite of what an interrupt should do.
-    var interrupt = std.atomic.Value(bool).init(false);
+    // Ctrl-C (or SIGTERM) stops the run and still reports what was measured — a
+    // long run interrupted near its end otherwise threw all of it away. The
+    // watchers set a flag the runner polls rather than canceling it:
+    // cancellation discards the measurement, the opposite of what an interrupt
+    // should do here.
+    var interrupt: Interrupt = .{};
     var sig_group: Io.Group = .init;
     const watching = installInterrupt(io, &sig_group, &interrupt);
     defer if (watching) sig_group.cancel(io);
 
-    const result = runner.run(arena, io, &cfg, frame_ns, ctx, cb, if (watching) &interrupt else null) catch |err| {
+    const result = runner.run(arena, io, &cfg, frame_ns, ctx, cb, if (watching) &interrupt.flag else null) catch |err| {
         try printRunError(io, err);
         std.process.exit(1);
     };
@@ -112,9 +113,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // An interrupted run is not a result to gate on: it covers less than
-    // --duration, so a passing --slo-p99 would mean nothing. Exit 130 (the
-    // shell's SIGINT convention) without evaluating the gates.
-    if (result.interrupted) std.process.exit(130);
+    // --duration, so a passing --slo-p99 would mean nothing. Exit 128+signal
+    // without evaluating the gates.
+    if (result.interrupted) std.process.exit(interrupt.exit_code.load(.monotonic));
 
     // CI gates: a breach exits 3 so a harness can fail the build.
     const slo = report.checkSlo(&cfg, &snapshot);
@@ -124,29 +125,59 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-/// Watch for SIGINT for the duration of the run. The first one asks the runner
-/// to stop and report; a second means the user wants out now, so take the
-/// process down rather than waiting for a graceful stop that is evidently not
-/// arriving. Returns false if the watcher could not be installed, in which case
-/// the default disposition stays and Ctrl-C kills the process as before.
-fn installInterrupt(io: Io, group: *Io.Group, flag: *std.atomic.Value(bool)) bool {
-    group.concurrent(io, watchInterrupt, .{ io, flag }) catch return false;
-    return true;
+/// Shared state for the signal watchers. One watcher runs per signal kind, so
+/// everything here is touched from several tasks at once.
+const Interrupt = struct {
+    /// Polled by the runner's progress loop; raising it ends the run early.
+    flag: std.atomic.Value(bool) = .init(false),
+    /// Claimed by whichever watcher sees the *first* signal. Shared across kinds
+    /// so SIGINT-then-SIGTERM aborts rather than printing a second notice — two
+    /// tasks writing stderr at once interleave and truncate each other.
+    claimed: std.atomic.Value(bool) = .init(false),
+    /// 128 + signal number, the shell's convention: 130 for SIGINT, 143 for
+    /// SIGTERM. Set by the watcher that claims the stop.
+    exit_code: std.atomic.Value(u8) = .init(130),
+};
+
+/// Watch for SIGINT and SIGTERM for the duration of the run. The first signal
+/// asks the runner to stop and report; a second (of either kind) means whoever
+/// sent it wants out now, so take the process down rather than keep waiting on
+/// a graceful stop that is evidently not arriving. Returns false if no watcher
+/// could be installed, in which case the default disposition stays and a signal
+/// kills the process as before.
+fn installInterrupt(io: Io, group: *Io.Group, it: *Interrupt) bool {
+    var any = false;
+    // SIGTERM matters as much as SIGINT here: `docker stop` and most CI
+    // cancellations send it, and without this a containerized run loses
+    // everything it measured.
+    for ([_]SignalSpec{
+        .{ .kind = .interrupt, .code = 130, .notice = "\nzrk: interrupt received, stopping (Ctrl-C again to abort)\n" },
+        .{ .kind = .terminate, .code = 143, .notice = "\nzrk: SIGTERM received, stopping (signal again to abort)\n" },
+    }) |spec| {
+        group.concurrent(io, watchSignal, .{ io, spec, it }) catch continue;
+        any = true;
+    }
+    return any;
 }
 
-fn watchInterrupt(io: Io, flag: *std.atomic.Value(bool)) void {
-    var sig = zio.Signal.init(.interrupt) catch return;
+const SignalSpec = struct {
+    kind: zio.SignalKind,
+    code: u8,
+    notice: []const u8,
+};
+
+fn watchSignal(io: Io, spec: SignalSpec, it: *Interrupt) void {
+    var sig = zio.Signal.init(spec.kind) catch return;
     defer sig.deinit();
-    sig.wait() catch return; // canceled at end of run
-    flag.store(true, .monotonic);
-    // Sole owner of the interrupt notice. `main` deliberately prints nothing
-    // more: two tasks writing stderr concurrently interleaved and truncated
-    // each other, and the graceful stop can take a moment at high `-c`, so the
-    // message that matters is this one — printed the instant Ctrl-C lands,
-    // telling the user it was heard and how to give up waiting.
-    writeAll(io, .stderr(), "\nzrk: interrupt received, stopping (Ctrl-C again to abort)\n") catch {};
-    sig.wait() catch return;
-    std.process.exit(130);
+    while (true) {
+        sig.wait() catch return; // canceled at end of run
+        // Whoever gets here first owns the stop and the notice; anyone after —
+        // a repeat of this signal, or the other kind — is the abort request.
+        if (it.claimed.swap(true, .acq_rel)) std.process.exit(spec.code);
+        it.exit_code.store(spec.code, .monotonic);
+        it.flag.store(true, .monotonic);
+        writeAll(io, .stderr(), spec.notice) catch {};
+    }
 }
 
 /// Write the wrk2-style text report to `--output` (text mode with -o set).
