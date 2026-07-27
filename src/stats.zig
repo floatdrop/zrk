@@ -13,9 +13,23 @@ const hdr = @import("hdr.zig");
 const connection = @import("connection.zig");
 const tlsmod = @import("tls.zig");
 
-/// Latency histogram configuration: 1µs .. 1h at 3 significant figures.
+/// Latency histogram configuration: 1µs .. 60s at 3 significant figures.
+///
+/// The ceiling is a memory decision, not a resolution one: `counts_len` grows
+/// by `sub_bucket_half_count` (1024 u64 = 8KiB) per power-of-two of range, and
+/// every connection owns two of these histograms (live + snapshot slot). A 1h
+/// ceiling cost 184KiB each — 3.8GB of resident memory at `-c10000`. 60s brings
+/// that to 136KiB, and the buckets above it only ever held latencies that no
+/// longer describe a system anyone is still measuring.
+///
+/// Values above the ceiling are clamped into the top bucket, never dropped
+/// (see `hdr.recordCount`), so a run that blows past 60s still reports every
+/// request — the tail just saturates at "60s or worse" instead of resolving how
+/// much worse. `--timeout` (2s by default) bounds wire time; only the
+/// coordinated-omission correction can reach this far, and only when the client
+/// or server has already fallen catastrophically behind.
 pub const hist_lowest: u64 = 1;
-pub const hist_highest: u64 = 3_600_000_000;
+pub const hist_highest: u64 = 60_000_000;
 pub const hist_sig_figs: u8 = 3;
 
 pub fn newHistogram(allocator: Allocator) !hdr.Histogram {
@@ -146,6 +160,23 @@ pub const Fleet = struct {
 
 const testing = std.testing;
 const zio = @import("zio");
+
+test "the default histogram's footprint stays within budget" {
+    var h = try newHistogram(testing.allocator);
+    defer h.deinit();
+    // Every connection owns two of these (live + snapshot slot), so counts_len
+    // is a memory budget rather than an implementation detail: each additional
+    // power-of-two of range adds 1024 u64 = 8KiB here, which is another 160MiB
+    // resident at `-c10000`. Raising `hist_highest` should be a deliberate
+    // trade, so pin the geometry.
+    try testing.expectEqual(@as(u32, 17 * 1024), h.counts_len);
+    try testing.expectEqual(@as(usize, 136 * 1024), h.counts.len * @sizeOf(u64));
+
+    // The ceiling clamps rather than drops: a 10-minute outlier still counts.
+    h.record(600 * std.time.us_per_s);
+    try testing.expectEqual(@as(u64, 1), h.count());
+    try testing.expectEqual(hist_highest, h.max_value);
+}
 
 test "fleet aggregates live counters and histograms" {
     var fleet = try Fleet.init(testing.allocator, 3, std.time.ns_per_s, false);

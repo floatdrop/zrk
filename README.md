@@ -255,10 +255,13 @@ behind the offered schedule — a companion to `rate_ratio` / `achieved_rate`.
 - **One request in flight per connection** (like wrk/wrk2). Throughput comes
   from running many connections; the total `-R` rate is split evenly across
   them, and each connection paces its own sends to that schedule.
-- **HdrHistogram** records every request's corrected latency (1µs–1h, 3
+- **HdrHistogram** records every request's corrected latency (1µs–60s, 3
   significant figures). Each connection owns its own histogram (lock-free hot
   path) and publishes a snapshot once per `--interval` for the dashboard; the
-  final report aggregates all histograms after the run.
+  final report aggregates all histograms after the run. Latencies above 60s are
+  clamped into the top bucket rather than dropped, so the request is still
+  counted but the reported tail saturates there. Two histograms per connection
+  at ~136KiB each is the bulk of zrk's memory: budget ~280KiB per `-c`.
 - Connections run as coroutines on a [zio](https://github.com/lalinsky/zio)
   io_uring runtime (`std.Io`-compatible), one connection per coroutine.
 
