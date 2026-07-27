@@ -220,6 +220,10 @@ fn printRunError(io: Io, err: anyerror) !void {
             .{@errorName(err)},
         ) catch "zrk: could not resolve the target host\n",
         error.NoConnectionsLaunched => "zrk: could not launch any connections\n",
+        // The run was cut short, so there is no full-duration sample to report.
+        // Say so and exit nonzero rather than emitting a report that looks
+        // complete but covers a fraction of --duration.
+        error.Canceled => "zrk: run was interrupted before --duration elapsed; no report written\n",
         else => std.fmt.bufPrint(
             &buf,
             "zrk: {s} (try -k to skip TLS verification if this is certificate-related)\n",

@@ -161,7 +161,17 @@ pub fn run(
         if (before.nanoseconds >= end.nanoseconds) break;
         const next_wake = @min(@min(next_frame, next_row), end.nanoseconds);
         if (next_wake > before.nanoseconds) {
-            io.sleep(Io.Duration.fromNanoseconds(@intCast(next_wake - before.nanoseconds)), .awake) catch break;
+            // Propagate rather than `catch break`. The only failure here is
+            // cancellation, and breaking would run the normal completion path:
+            // the caller would get a Report that looks like a finished run but
+            // covers a fraction of `--duration`, with nothing marking it short.
+            // A CI gate (`--slo-p99`, `--max-error-rate`) would then pass on a
+            // sample that was never collected. Unreachable from the CLI, which
+            // never cancels this task, but `run` is the embeddable entry point
+            // and an embedder's coroutine can be canceled — and when it is, the
+            // caller asked to stop and should learn the run did not complete.
+            // The errdefer above stops and joins the connections on the way out.
+            try io.sleep(Io.Duration.fromNanoseconds(@intCast(next_wake - before.nanoseconds)), .awake);
         }
 
         const t = Io.Timestamp.now(io, .awake);
@@ -292,6 +302,56 @@ test "run's elapsed time tracks the duration, not the interval grid" {
     // the quantization regression would report >= 1.0s.
     try testing.expect(result.elapsed_s >= 0.29);
     try testing.expect(result.elapsed_s < 0.9);
+}
+
+/// Runs a load test to completion and stores whatever `run` returned, so a
+/// canceled run's outcome can be inspected from outside the coroutine.
+fn runCapturing(io: Io, gpa: std.mem.Allocator, cfg: *const cli.Config, out: *?anyerror!Report) void {
+    out.* = run(gpa, io, cfg, 0, null, null);
+}
+
+test "a canceled run propagates instead of reporting a truncated success" {
+    // `run` is the embeddable entry point, so an embedder can cancel the
+    // coroutine it runs in. Swallowing that (the old `catch break`) returned a
+    // Report covering a fraction of --duration with nothing marking it short,
+    // which a CI gate would then happily evaluate.
+    var rt = try zio.Runtime.init(testing.allocator, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    var serve_group: Io.Group = .init;
+    serve_group.async(io, testServe, .{ io, &server });
+    const port = server.socket.address.getPort();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var cfg: cli.Config = .{
+        .connections = 1,
+        .rate = 100,
+        // Long enough that cancellation lands mid-sleep, well before `end`.
+        .duration_ns = 60 * std.time.ns_per_s,
+        .interval_ns = 1 * std.time.ns_per_s,
+        .url = try cli.parseUrl(url),
+    };
+
+    var outcome: ?anyerror!Report = null;
+    var run_group: Io.Group = .init;
+    try run_group.concurrent(io, runCapturing, .{ io, arena_state.allocator(), &cfg, &outcome });
+
+    // Let it reach the progress loop's sleep, then cancel out from under it.
+    io.sleep(Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
+    run_group.cancel(io); // waits for the task to unwind
+
+    serve_group.cancel(io);
+    server.deinit(io);
+
+    // Must be the error, not a short-but-successful Report.
+    try testing.expectError(error.Canceled, outcome.?);
 }
 
 test {
