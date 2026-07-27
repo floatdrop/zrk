@@ -22,6 +22,11 @@ pub const Report = struct {
     snapshot: stats.Snapshot,
     elapsed_s: f64,
     launched: u32,
+    /// The run stopped early because the caller raised `interrupt`. The report
+    /// covers `elapsed_s`, not the configured duration — a consumer that gates
+    /// on these numbers (an SLO check, a regression baseline) must not treat an
+    /// interrupted run as a completed one.
+    interrupted: bool = false,
 };
 
 /// Which consumers a progress callback is for. The dashboard redraws on the
@@ -42,6 +47,13 @@ pub const ProgressFn = *const fn (
     tick: Tick,
 ) void;
 
+/// How often the progress loop rechecks `interrupt` while otherwise idle. The
+/// loop already sleeps only to its next frame/row deadline, which with a long
+/// `--interval` can be seconds away; capping the sleep bounds how long a
+/// Ctrl-C sits unnoticed. The extra wakes are nearly free — one timestamp and
+/// two comparisons, then straight back to sleep, since no tick deadline passed.
+const interrupt_poll_ns: i128 = 100 * std.time.ns_per_ms;
+
 /// Run one constant-throughput load test to completion. Blocks the
 /// calling thread (worker connections run on executor threads); returns
 /// after the configured duration with the final merged report.
@@ -57,6 +69,10 @@ pub fn run(
     frame_interval_ns: u64,
     progress_context: ?*anyopaque,
     progress: ?ProgressFn,
+    /// Raise to stop the run early and return what was measured so far, with
+    /// `Report.interrupted` set. Preferred over canceling the task running
+    /// `run`: cancellation discards the measurement, this keeps it.
+    interrupt: ?*const std.atomic.Value(bool),
 ) !Report {
     const request = try httpmod.buildRequest(arena, cfg);
     const address = try resolveAddress(io, cfg.url.host, cfg.url.port);
@@ -156,10 +172,18 @@ pub fn run(
     const frame_ns: i128 = if (frame_interval_ns > 0) @intCast(frame_interval_ns) else row_ns;
     var next_row: i128 = start.nanoseconds + row_ns;
     var next_frame: i128 = start.nanoseconds + frame_ns;
+    var interrupted = false;
     while (true) {
+        if (interrupt) |flag| if (flag.load(.monotonic)) {
+            interrupted = true;
+            break;
+        };
         const before = Io.Timestamp.now(io, .awake);
         if (before.nanoseconds >= end.nanoseconds) break;
-        const next_wake = @min(@min(next_frame, next_row), end.nanoseconds);
+        var next_wake = @min(@min(next_frame, next_row), end.nanoseconds);
+        // Bound the sleep so the interrupt check above runs on a fixed cadence
+        // rather than only at the next frame/row deadline.
+        if (interrupt != null) next_wake = @min(next_wake, before.nanoseconds + interrupt_poll_ns);
         if (next_wake > before.nanoseconds) {
             // Propagate rather than `catch break`. The only failure here is
             // cancellation, and breaking would run the normal completion path:
@@ -205,7 +229,12 @@ pub fn run(
     const elapsed = start.durationTo(Io.Timestamp.now(io, .awake));
     const elapsed_s: f64 = @as(f64, @floatFromInt(elapsed.nanoseconds)) / std.time.ns_per_s;
     fleet.readFinal(&snap);
-    return .{ .snapshot = snap, .elapsed_s = elapsed_s, .launched = launched };
+    return .{
+        .snapshot = snap,
+        .elapsed_s = elapsed_s,
+        .launched = launched,
+        .interrupted = interrupted,
+    };
 }
 
 /// Resolve a host (literal IP or DNS name) to a single address. DNS is
@@ -291,7 +320,7 @@ test "run's elapsed time tracks the duration, not the interval grid" {
         .interval_ns = 1 * std.time.ns_per_s,
         .url = try cli.parseUrl(url),
     };
-    const result = try run(arena_state.allocator(), io, &cfg, 0, null, null);
+    const result = try run(arena_state.allocator(), io, &cfg, 0, null, null, null);
 
     group.await(io) catch {};
     server.deinit(io);
@@ -304,10 +333,59 @@ test "run's elapsed time tracks the duration, not the interval grid" {
     try testing.expect(result.elapsed_s < 0.9);
 }
 
+test "an interrupted run keeps its measurement and says it was cut short" {
+    var rt = try zio.Runtime.init(testing.allocator, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    var serve_group: Io.Group = .init;
+    serve_group.async(io, testServe, .{ io, &server });
+    const port = server.socket.address.getPort();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var cfg: cli.Config = .{
+        .connections = 1,
+        .rate = 500,
+        .duration_ns = 60 * std.time.ns_per_s,
+        // Far longer than the run will last: the interrupt must not wait for a
+        // stats window to come around.
+        .interval_ns = 30 * std.time.ns_per_s,
+        .url = try cli.parseUrl(url),
+    };
+
+    var interrupt = std.atomic.Value(bool).init(false);
+    var raiser: Io.Group = .init;
+    raiser.async(io, raiseAfter, .{ io, &interrupt, 200 * std.time.ns_per_ms });
+
+    const result = try run(arena_state.allocator(), io, &cfg, 0, null, null, &interrupt);
+
+    raiser.cancel(io);
+    serve_group.cancel(io);
+    server.deinit(io);
+
+    try testing.expect(result.interrupted);
+    // Stopped near the interrupt, not at the 60s duration or the 30s window.
+    try testing.expect(result.elapsed_s >= 0.19);
+    try testing.expect(result.elapsed_s < 5.0);
+    // The whole point: the partial run's measurement survives.
+    try testing.expect(result.snapshot.counters.completed > 0);
+}
+
+fn raiseAfter(io: Io, flag: *std.atomic.Value(bool), delay_ns: u64) void {
+    io.sleep(Io.Duration.fromNanoseconds(delay_ns), .awake) catch return;
+    flag.store(true, .monotonic);
+}
+
 /// Runs a load test to completion and stores whatever `run` returned, so a
 /// canceled run's outcome can be inspected from outside the coroutine.
 fn runCapturing(io: Io, gpa: std.mem.Allocator, cfg: *const cli.Config, out: *?anyerror!Report) void {
-    out.* = run(gpa, io, cfg, 0, null, null);
+    out.* = run(gpa, io, cfg, 0, null, null, null);
 }
 
 test "a canceled run propagates instead of reporting a truncated success" {

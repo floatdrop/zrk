@@ -61,6 +61,7 @@ pub fn writeJson(
     snap: *const stats.Snapshot,
     elapsed_s: f64,
     launched: u32,
+    interrupted: bool,
 ) !void {
     const c = snap.counters;
     const h = &snap.hist;
@@ -96,6 +97,10 @@ pub fn writeJson(
     );
 
     try w.print("  \"duration_s\": {d:.3},\n", .{elapsed_s});
+    // Explicit rather than leaving a consumer to infer it from duration_s being
+    // short of config.duration_s: an interrupted run is not a completed one, and
+    // whatever reads this (a CI gate, a regression baseline) needs to say so.
+    if (interrupted) try w.print("  \"interrupted\": true,\n", .{});
     try w.print("  \"requests\": {d},\n", .{c.completed});
     try w.print("  \"bytes\": {d},\n", .{c.bytes});
     try w.print("  \"achieved_rate\": {d:.2},\n", .{achieved});
@@ -297,7 +302,7 @@ test "writeJson emits parseable, well-formed summary" {
     defer alloc.deinit();
     var cfg = testConfig();
     cfg.deadline_ns = 250 * std.time.ns_per_ms;
-    try writeJson(testing.allocator, &alloc.writer, &cfg, &snap, 1.0, 4);
+    try writeJson(testing.allocator, &alloc.writer, &cfg, &snap, 1.0, 4, false);
     const out = alloc.written();
 
     // Spot-check structure and key fields.

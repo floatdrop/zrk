@@ -81,14 +81,23 @@ pub fn main(init: std.process.Init) !void {
     // and headless runs stay on the --interval stats window.
     const frame_ns: u64 = if (progress.dash != null and dash.tui) cfg.refresh_ns else 0;
 
-    const result = runner.run(arena, io, &cfg, frame_ns, ctx, cb) catch |err| {
+    // Ctrl-C stops the run and still reports what was measured — a long run
+    // interrupted near its end otherwise threw all of it away. The watcher sets
+    // a flag the runner polls rather than canceling it: cancellation discards
+    // the measurement, which is the opposite of what an interrupt should do.
+    var interrupt = std.atomic.Value(bool).init(false);
+    var sig_group: Io.Group = .init;
+    const watching = installInterrupt(io, &sig_group, &interrupt);
+    defer if (watching) sig_group.cancel(io);
+
+    const result = runner.run(arena, io, &cfg, frame_ns, ctx, cb, if (watching) &interrupt else null) catch |err| {
         try printRunError(io, err);
         std.process.exit(1);
     };
     var snapshot = result.snapshot;
 
     if (json) {
-        try writeJsonReport(arena, io, &cfg, &snapshot, result.elapsed_s, result.launched);
+        try writeJsonReport(arena, io, &cfg, &snapshot, result.elapsed_s, result.launched, result.interrupted);
     } else if (cfg.output_path) |path| {
         // Text report redirected to --output; leave a breadcrumb on stdout.
         try writeTextReport(io, &dash, path, &snapshot, result.elapsed_s);
@@ -102,12 +111,42 @@ pub fn main(init: std.process.Init) !void {
         try writeHdrFile(io, path, &snapshot.hist);
     }
 
+    // An interrupted run is not a result to gate on: it covers less than
+    // --duration, so a passing --slo-p99 would mean nothing. Exit 130 (the
+    // shell's SIGINT convention) without evaluating the gates.
+    if (result.interrupted) std.process.exit(130);
+
     // CI gates: a breach exits 3 so a harness can fail the build.
     const slo = report.checkSlo(&cfg, &snapshot);
     if (!slo.passed()) {
         try printSloBreach(io, &cfg, &snapshot, slo);
         std.process.exit(3);
     }
+}
+
+/// Watch for SIGINT for the duration of the run. The first one asks the runner
+/// to stop and report; a second means the user wants out now, so take the
+/// process down rather than waiting for a graceful stop that is evidently not
+/// arriving. Returns false if the watcher could not be installed, in which case
+/// the default disposition stays and Ctrl-C kills the process as before.
+fn installInterrupt(io: Io, group: *Io.Group, flag: *std.atomic.Value(bool)) bool {
+    group.concurrent(io, watchInterrupt, .{ io, flag }) catch return false;
+    return true;
+}
+
+fn watchInterrupt(io: Io, flag: *std.atomic.Value(bool)) void {
+    var sig = zio.Signal.init(.interrupt) catch return;
+    defer sig.deinit();
+    sig.wait() catch return; // canceled at end of run
+    flag.store(true, .monotonic);
+    // Sole owner of the interrupt notice. `main` deliberately prints nothing
+    // more: two tasks writing stderr concurrently interleaved and truncated
+    // each other, and the graceful stop can take a moment at high `-c`, so the
+    // message that matters is this one — printed the instant Ctrl-C lands,
+    // telling the user it was heard and how to give up waiting.
+    writeAll(io, .stderr(), "\nzrk: interrupt received, stopping (Ctrl-C again to abort)\n") catch {};
+    sig.wait() catch return;
+    std.process.exit(130);
 }
 
 /// Write the wrk2-style text report to `--output` (text mode with -o set).
@@ -121,13 +160,13 @@ fn writeTextReport(io: Io, dash: *tui.Dashboard, path: []const u8, snap: *const 
 }
 
 /// Write the JSON summary to `--output` (or stdout when unset).
-fn writeJsonReport(gpa: std.mem.Allocator, io: Io, cfg: *const cli.Config, snap: *const stats.Snapshot, elapsed_s: f64, launched: u32) !void {
+fn writeJsonReport(gpa: std.mem.Allocator, io: Io, cfg: *const cli.Config, snap: *const stats.Snapshot, elapsed_s: f64, launched: u32, interrupted: bool) !void {
     var close = false;
     const file = try openOut(io, cfg.output_path, &close);
     defer if (close) file.close(io);
     var buf: [8192]u8 = undefined;
     var fw: Io.File.Writer = .init(file, io, &buf);
-    try report.writeJson(gpa, &fw.interface, cfg, snap, elapsed_s, launched);
+    try report.writeJson(gpa, &fw.interface, cfg, snap, elapsed_s, launched, interrupted);
     try fw.interface.flush();
 }
 

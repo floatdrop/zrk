@@ -101,6 +101,25 @@ zrk [options] <url>
 Durations accept `us`, `ms`, `s`, `m`, `h` (a bare number is seconds).
 Short options may be attached (`-c100`) or separated (`-c 100`).
 
+### Interrupting a run
+
+`Ctrl-C` stops the run and still reports what was measured, rather than
+discarding it — useful when a long run has already shown you what you needed.
+The report covers the elapsed time, not `--duration`: `duration_s` is the real
+figure, `--format json` adds `"interrupted": true`, and the exit code is **130**.
+CI gates are *not* evaluated on an interrupted run, so a partial sample can
+never report a passing `--slo-p99`. A second `Ctrl-C` aborts immediately.
+
+### Exit codes
+
+| code | meaning |
+|------|---------|
+| 0 | run completed; any configured gates passed |
+| 1 | the run failed to start or complete (see the message on stderr) |
+| 2 | bad arguments, or a `--body` file that could not be read |
+| 3 | run completed but a `--slo-p99` / `--max-error-rate` gate was breached |
+| 130 | interrupted with `Ctrl-C`; a partial report was still written |
+
 ### Examples
 
 ```sh
