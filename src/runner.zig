@@ -79,6 +79,14 @@ pub fn run(
     var fleet = try stats.Fleet.init(arena, cfg.connections, publish_ns, cfg.url.isTls());
     defer fleet.deinit();
 
+    // Merging the fleet's per-connection histograms is O(connections) and does
+    // not yield, so it runs on its own thread instead of on this one — this
+    // thread is executor 0, and stalling it stalls the connections it hosts.
+    // Declared after `fleet` so it is joined before those histograms are freed.
+    var sweeper = try stats.Sweeper.init(arena, &fleet, io);
+    defer sweeper.deinit();
+    sweeper.start();
+
     var stop = std.atomic.Value(bool).init(false);
 
     // Per-connection send schedule: a constant spacing, or a linear ramp from
@@ -170,7 +178,7 @@ pub fn run(
         while (next_frame <= t.nanoseconds) next_frame += frame_ns;
         while (next_row <= t.nanoseconds) next_row += row_ns;
 
-        fleet.readSnapshot(io, &snap);
+        sweeper.snapshot(&snap);
         const elapsed_s: f64 = @as(f64, @floatFromInt(start.durationTo(t).nanoseconds)) / std.time.ns_per_s;
         if (progress) |callback| {
             callback(progress_context, &snap, t.nanoseconds, elapsed_s, total_s, tick);
