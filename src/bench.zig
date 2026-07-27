@@ -19,9 +19,9 @@ fn nowNs(io: Io) i128 {
     return Io.Timestamp.now(io, .awake).nanoseconds;
 }
 
-// Production histogram parameters (mirror stats.zig: 1µs .. 1h, 3 sig figs).
+// Production histogram parameters (mirror stats.zig: 1µs .. 60s, 3 sig figs).
 const lowest: u64 = 1;
-const highest: u64 = 3_600_000_000;
+const highest: u64 = 60_000_000;
 const sig_figs: u8 = 3;
 
 /// Fill `h` with a log-normal-ish latency spread (median ~3ms, tail to ~80ms,

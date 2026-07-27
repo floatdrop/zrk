@@ -5,17 +5,35 @@
 //! into a mutex-guarded snapshot slot; the dashboard reads those snapshots. The
 //! final report aggregates the live histograms directly after all connections
 //! have stopped, so no locking is needed there.
+//!
+//! Reading those snapshots costs O(connections), so `Sweeper` runs it on a
+//! dedicated thread rather than on an executor — see its doc comment.
 
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const hdr = @import("hdr.zig");
 const connection = @import("connection.zig");
 const tlsmod = @import("tls.zig");
 
-/// Latency histogram configuration: 1µs .. 1h at 3 significant figures.
+/// Latency histogram configuration: 1µs .. 60s at 3 significant figures.
+///
+/// The ceiling is a memory decision, not a resolution one: `counts_len` grows
+/// by `sub_bucket_half_count` (1024 u64 = 8KiB) per power-of-two of range, and
+/// every connection owns two of these histograms (live + snapshot slot). A 1h
+/// ceiling cost 184KiB each — 3.8GB of resident memory at `-c10000`. 60s brings
+/// that to 136KiB, and the buckets above it only ever held latencies that no
+/// longer describe a system anyone is still measuring.
+///
+/// Values above the ceiling are clamped into the top bucket, never dropped
+/// (see `hdr.recordCount`), so a run that blows past 60s still reports every
+/// request — the tail just saturates at "60s or worse" instead of resolving how
+/// much worse. `--timeout` (2s by default) bounds wire time; only the
+/// coordinated-omission correction can reach this far, and only when the client
+/// or server has already fallen catastrophically behind.
 pub const hist_lowest: u64 = 1;
-pub const hist_highest: u64 = 3_600_000_000;
+pub const hist_highest: u64 = 60_000_000;
 pub const hist_sig_figs: u8 = 3;
 
 pub fn newHistogram(allocator: Allocator) !hdr.Histogram {
@@ -110,7 +128,11 @@ pub const Fleet = struct {
 
     /// Aggregate the most recently published snapshot from every connection.
     /// Safe to call concurrently with running connections.
-    pub fn readSnapshot(self: *Fleet, io: std.Io, dst: *Snapshot) void {
+    ///
+    /// O(connections) in full histograms merged, so this is the pass `Sweeper`
+    /// exists to keep off the executor threads; call it directly only when
+    /// nothing is racing for the CPU.
+    pub fn readSnapshot(self: *Fleet, io: Io, dst: *Snapshot) void {
         dst.hist.reset();
         dst.counters = .{};
         for (self.publish) |*p| {
@@ -142,10 +164,143 @@ pub const Fleet = struct {
     }
 };
 
+/// Runs `Fleet.readSnapshot` on a dedicated OS thread.
+///
+/// The merge adds one full histogram per connection, so its cost scales with
+/// `-c`: at `-c10000` a single pass is ~10^8 u64 adds, on the order of 100ms.
+/// Running that inline stalled the calling thread — which is also zio's
+/// executor 0, servicing 1/threads of the connections — for that whole time,
+/// once per publish interval. Those connections then missed their paced sends,
+/// and because latency is measured from the *scheduled* send, the stall was
+/// charged to the server under test. Bumping `--threads` only shrank the share
+/// of connections caught behind it; moving the work off the executor removes it.
+///
+/// The handshake is a plain condvar, but which side it parks differs by caller:
+/// `Io.Mutex`/`Io.Condition` are futex-backed and dispatch through the `Io`
+/// vtable, and zio parks a task on its scheduler while parking a foreign thread
+/// on an OS futex (see zio's `Waiter.wait`). So the same two primitives block
+/// this thread outright, while `snapshot` suspends only the calling *coroutine*
+/// — its executor keeps running connections for the length of the merge.
+///
+/// `snapshot` waits for a merge that started after it asked, so the result is
+/// exactly as fresh as the inline call it replaces; per-interval timeseries
+/// rows keep lining up with the wall-clock window they claim to cover. A single
+/// caller is assumed (the runner's progress loop).
+pub const Sweeper = struct {
+    fleet: *Fleet,
+    io: Io,
+
+    mutex: Io.Mutex = .init,
+    /// Carries both directions: a request to the thread, a result to the caller.
+    cond: Io.Condition = .init,
+    /// A merge has been asked for and has not been picked up yet.
+    requested: bool = false,
+    /// Bumped every time a merged result lands in `result`.
+    completed: u64 = 0,
+    quit: bool = false,
+
+    /// Merge target. Private to the thread while a pass runs, which is what
+    /// keeps the time spent holding `mutex` down to one buffer swap.
+    scratch: Snapshot,
+    /// Most recent completed merge; guarded by `mutex`.
+    result: Snapshot,
+
+    /// Null when the thread could not be spawned; `snapshot` then falls back to
+    /// merging inline, which is slow but correct.
+    thread: ?std.Thread = null,
+
+    pub fn init(allocator: Allocator, fleet: *Fleet, io: Io) !Sweeper {
+        var scratch: Snapshot = .{ .hist = try newHistogram(allocator), .counters = .{} };
+        errdefer scratch.deinit();
+        const result: Snapshot = .{ .hist = try newHistogram(allocator), .counters = .{} };
+        return .{ .fleet = fleet, .io = io, .scratch = scratch, .result = result };
+    }
+
+    /// Spawn the sweeper thread. Must be called on a pinned `Sweeper` (the
+    /// thread keeps the pointer). Spawn failure is not fatal: `snapshot` then
+    /// merges inline, exactly as it did before this thread existed.
+    pub fn start(self: *Sweeper) void {
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch null;
+    }
+
+    fn run(self: *Sweeper) void {
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        while (true) {
+            while (!self.requested and !self.quit) self.cond.waitUncancelable(io, &self.mutex);
+            if (self.quit) return;
+            self.requested = false;
+
+            // Merge unlocked: holding `mutex` across the expensive pass would
+            // just relocate the stall onto whoever calls `snapshot` next.
+            self.mutex.unlock(io);
+            self.fleet.readSnapshot(io, &self.scratch);
+            self.mutex.lockUncancelable(io);
+
+            std.mem.swap(Snapshot, &self.scratch, &self.result);
+            self.completed += 1;
+            self.cond.broadcast(io);
+        }
+    }
+
+    /// Request a fresh merge and block until it lands, then copy it into `dst`.
+    /// Suspends the calling coroutine rather than its executor thread.
+    pub fn snapshot(self: *Sweeper, dst: *Snapshot) void {
+        const io = self.io;
+        if (self.thread == null) return self.fleet.readSnapshot(io, dst);
+
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        // Wait for a merge that completes *after* this call: a pass already in
+        // flight may have read half the fleet before we asked.
+        const target = self.completed + 1;
+        self.requested = true;
+        self.cond.broadcast(io);
+        while (self.completed < target and !self.quit) self.cond.waitUncancelable(io, &self.mutex);
+
+        self.result.hist.copyInto(&dst.hist);
+        dst.counters = self.result.counters;
+    }
+
+    /// Stop and join the thread, then release the merge buffers. Must run
+    /// before the `Fleet` it borrows is torn down.
+    pub fn deinit(self: *Sweeper) void {
+        if (self.thread) |thread| {
+            self.mutex.lockUncancelable(self.io);
+            self.quit = true;
+            self.cond.broadcast(self.io);
+            self.mutex.unlock(self.io);
+            thread.join();
+            self.thread = null;
+        }
+        self.scratch.deinit();
+        self.result.deinit();
+    }
+};
+
 // --- tests -------------------------------------------------------------------
 
 const testing = std.testing;
 const zio = @import("zio");
+
+test "the default histogram's footprint stays within budget" {
+    var h = try newHistogram(testing.allocator);
+    defer h.deinit();
+    // Every connection owns two of these (live + snapshot slot), so counts_len
+    // is a memory budget rather than an implementation detail: each additional
+    // power-of-two of range adds 1024 u64 = 8KiB here, which is another 160MiB
+    // resident at `-c10000`. Raising `hist_highest` should be a deliberate
+    // trade, so pin the geometry.
+    try testing.expectEqual(@as(u32, 17 * 1024), h.counts_len);
+    try testing.expectEqual(@as(usize, 136 * 1024), h.counts.len * @sizeOf(u64));
+
+    // The ceiling clamps rather than drops: a 10-minute outlier still counts.
+    h.record(600 * std.time.us_per_s);
+    try testing.expectEqual(@as(u64, 1), h.count());
+    try testing.expectEqual(hist_highest, h.max_value);
+}
 
 test "fleet aggregates live counters and histograms" {
     var fleet = try Fleet.init(testing.allocator, 3, std.time.ns_per_s, false);
@@ -196,4 +351,82 @@ test "readSnapshot reflects published state" {
 
     try testing.expectEqual(@as(u64, 14), snap.counters.completed);
     try testing.expectEqual(@as(u64, 2), snap.hist.count());
+}
+
+test "Sweeper returns the same aggregate as an inline readSnapshot" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var fleet = try Fleet.init(testing.allocator, 8, std.time.ns_per_s, false);
+    defer fleet.deinit();
+    for (fleet.publish, 0..) |*p, i| {
+        p.hist.record(1000 * (@as(u64, @intCast(i)) + 1));
+        p.counters.completed = 7;
+        p.counters.bytes = 100;
+    }
+
+    var inline_snap: Snapshot = .{ .hist = try newHistogram(testing.allocator), .counters = .{} };
+    defer inline_snap.deinit();
+    fleet.readSnapshot(io, &inline_snap);
+
+    var sweeper = try Sweeper.init(testing.allocator, &fleet, io);
+    defer sweeper.deinit();
+    sweeper.start();
+    try testing.expect(sweeper.thread != null); // else the fallback path is under test, not the thread
+
+    var swept: Snapshot = .{ .hist = try newHistogram(testing.allocator), .counters = .{} };
+    defer swept.deinit();
+    sweeper.snapshot(&swept);
+
+    try testing.expectEqual(inline_snap.counters.completed, swept.counters.completed);
+    try testing.expectEqual(inline_snap.counters.bytes, swept.counters.bytes);
+    try testing.expectEqual(inline_snap.hist.count(), swept.hist.count());
+    try testing.expectEqual(inline_snap.hist.max_value, swept.hist.max_value);
+    try testing.expectEqual(inline_snap.hist.min_value, swept.hist.min_value);
+}
+
+test "each Sweeper.snapshot waits for a merge newer than the request" {
+    // Freshness is the property that keeps --timeseries rows aligned with the
+    // wall-clock window they claim to cover: returning the previous pass's
+    // result would credit this interval's counter delta to the wrong duration.
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var fleet = try Fleet.init(testing.allocator, 4, std.time.ns_per_s, false);
+    defer fleet.deinit();
+
+    var sweeper = try Sweeper.init(testing.allocator, &fleet, io);
+    defer sweeper.deinit();
+    sweeper.start();
+
+    var snap: Snapshot = .{ .hist = try newHistogram(testing.allocator), .counters = .{} };
+    defer snap.deinit();
+
+    // Every round publishes one more request per connection; the very next
+    // snapshot must already see it, with no intervening sleep.
+    for (1..6) |round| {
+        for (fleet.publish) |*p| {
+            p.mutex.lockUncancelable(io);
+            defer p.mutex.unlock(io);
+            p.hist.record(1000);
+            p.counters.completed = round;
+        }
+        sweeper.snapshot(&snap);
+        try testing.expectEqual(@as(u64, round * 4), snap.counters.completed);
+        try testing.expectEqual(@as(u64, round * 4), snap.hist.count());
+    }
+}
+
+test "Sweeper stops cleanly when no snapshot was ever taken" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+
+    var fleet = try Fleet.init(testing.allocator, 2, std.time.ns_per_s, false);
+    defer fleet.deinit();
+
+    var sweeper = try Sweeper.init(testing.allocator, &fleet, rt.io());
+    sweeper.start();
+    sweeper.deinit(); // must join the idle thread rather than hang
 }
