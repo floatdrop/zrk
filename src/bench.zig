@@ -100,21 +100,39 @@ pub fn main() !void {
     });
 
     // --- reset + N×add (per readSnapshot frame) ----------------------------
-    for ([_]usize{ 10, 100, 1000 }) |nconns| {
-        const iters = 2000;
+    //
+    // Merge N *distinct* histograms, the way the real sweep does. Re-adding one
+    // `src` N times instead keeps the source in L2 and measures a cache-resident
+    // merge: at N=10000 that reported a ~6% gain for vectorizing `add` where the
+    // real, RAM-streaming merge gains ~27%. The fleet must exceed cache for this
+    // number to mean anything.
+    for ([_]usize{ 100, 1000, 10_000 }) |nconns| {
+        const fleet = try a.alloc(hdr.Histogram, nconns);
+        defer a.free(fleet);
+        for (fleet, 0..) |*h, i| {
+            h.* = try hdr.Histogram.init(a, lowest, highest, sig_figs);
+            // Vary the seed per connection so spans differ slightly, as they do
+            // across real connections.
+            var p = std.Random.DefaultPrng.init(0xC0FFEE +% i);
+            recordRealistic(h, p.random(), 2_000);
+        }
+        defer for (fleet) |*h| h.deinit();
+
+        const resident = @as(f64, @floatFromInt(nconns * span * 8)) / (1024.0 * 1024.0);
+        const iters: usize = if (nconns >= 10_000) 20 else if (nconns >= 1000) 100 else 500;
         const start = nowNs(io);
         var it: usize = 0;
         while (it < iters) : (it += 1) {
             dst.reset();
-            var c: usize = 0;
-            while (c < nconns) : (c += 1) dst.add(&src);
+            for (fleet) |*h| dst.add(h);
             std.mem.doNotOptimizeAway(dst.counts[hi]);
         }
         const per_frame: u64 = @intCast(@divTrunc(nowNs(io) - start, iters));
+        const gbs = @as(f64, @floatFromInt(nconns * span * 8)) / @as(f64, @floatFromInt(per_frame));
         // Live TUI redraws at --refresh (80ms) => 12.5 frames/s.
-        const per_sec_us = @as(f64, @floatFromInt(per_frame)) * 12.5 / 1000.0;
-        print("readSnapshot N={d:>4}:  {d:>9} ns/frame   ({d:.2} ms/s of runner CPU @12.5fps)\n", .{
-            nconns, per_frame, per_sec_us / 1000.0,
+        const core_frac = @as(f64, @floatFromInt(per_frame)) * 12.5 / 1e9;
+        print("readSnapshot N={d:>5}: {d:>9} ns/pass  ({d:>5.1} MiB read, {d:.1} GB/s, {d:.0}% of a core @12.5fps)\n", .{
+            nconns, per_frame, resident, gbs, core_frac * 100.0,
         });
     }
 }
