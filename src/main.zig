@@ -72,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
         ts_file.close(io);
     };
 
-    var progress: Progress = .{ .dash = if (json) null else &dash, .ts = ts_ptr };
+    var progress: Progress = .{ .io = io, .dash = if (json) null else &dash, .ts = ts_ptr };
     const active = progress.dash != null or progress.ts != null;
     const ctx: ?*anyopaque = if (active) @ptrCast(&progress) else null;
     const cb: ?runner.ProgressFn = if (active) onProgress else null;
@@ -194,8 +194,14 @@ fn printSloBreach(io: Io, cfg: *const cli.Config, snap: *const stats.Snapshot, s
 /// Fan-out target for the runner's progress callback: the live dashboard and/or
 /// the NDJSON time series, whichever are active this run.
 const Progress = struct {
+    io: Io,
     dash: ?*tui.Dashboard,
     ts: ?*report.TimeSeries,
+    /// Set once a sink has reported a failure, so a persistently broken one
+    /// (a full disk, a closed pipe) warns a single time instead of on every
+    /// wake — this callback fires up to 12.5x a second with a live dashboard.
+    dash_failed: bool = false,
+    ts_failed: bool = false,
 };
 
 fn onProgress(
@@ -207,8 +213,35 @@ fn onProgress(
     tick: runner.Tick,
 ) void {
     const p: *Progress = @ptrCast(@alignCast(context.?));
-    if (tick.frame) if (p.dash) |d| d.frame(snapshot, now_ns, elapsed_s, total_s) catch {};
-    if (tick.row) if (p.ts) |t| t.record(snapshot, elapsed_s) catch {};
+    // A failing sink must not abort the run — the measurement is the point, and
+    // this callback cannot propagate anyway (ProgressFn returns void). But
+    // dropping the error silently meant a `--timeseries` file that stopped
+    // accepting writes produced a short file and a report that looked fine, with
+    // nothing said. Report it once and keep measuring.
+    if (tick.frame) if (p.dash) |d| d.frame(snapshot, now_ns, elapsed_s, total_s) catch |err| {
+        if (!p.dash_failed) {
+            p.dash_failed = true;
+            warnSinkFailed(p.io, "dashboard", err);
+        }
+    };
+    if (tick.row) if (p.ts) |t| t.record(snapshot, elapsed_s) catch |err| {
+        if (!p.ts_failed) {
+            p.ts_failed = true;
+            warnSinkFailed(p.io, "--timeseries", err);
+        }
+    };
+}
+
+/// Note a progress sink that stopped working, without derailing the run: this
+/// runs mid-measurement, so a failure to report the failure is itself ignored.
+fn warnSinkFailed(io: Io, sink: []const u8, err: anyerror) void {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "zrk: {s} output failed ({s}); continuing without it\n",
+        .{ sink, @errorName(err) },
+    ) catch "zrk: progress output failed; continuing without it\n";
+    writeAll(io, .stderr(), msg) catch {};
 }
 
 fn printRunError(io: Io, err: anyerror) !void {
@@ -220,6 +253,10 @@ fn printRunError(io: Io, err: anyerror) !void {
             .{@errorName(err)},
         ) catch "zrk: could not resolve the target host\n",
         error.NoConnectionsLaunched => "zrk: could not launch any connections\n",
+        // The run was cut short, so there is no full-duration sample to report.
+        // Say so and exit nonzero rather than emitting a report that looks
+        // complete but covers a fraction of --duration.
+        error.Canceled => "zrk: run was interrupted before --duration elapsed; no report written\n",
         else => std.fmt.bufPrint(
             &buf,
             "zrk: {s} (try -k to skip TLS verification if this is certificate-related)\n",
