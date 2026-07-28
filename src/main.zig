@@ -361,6 +361,8 @@ fn printUsageError(io: Io, err: cli.ParseError) !void {
         error.InvalidUrl => "zrk: invalid URL (expected http:// or https://)\n\n",
         error.InvalidHeader => "zrk: invalid header (expected 'Name: Value')\n\n",
         error.InvalidFormat => "zrk: invalid --format (expected 'text' or 'json')\n\n",
+        error.ZeroThreads => "zrk: threads (-t) must be greater than 0\n\n",
+        error.TooManyThreads => "zrk: threads (-t) exceeds the maximum this platform supports\n\n",
         error.ZeroConnections => "zrk: connections (-c) must be greater than 0\n\n",
         error.ZeroRate => "zrk: rate (-R) must be greater than 0\n\n",
         error.ZeroInterval => "zrk: --interval must be greater than 0\n\n",
