@@ -74,6 +74,10 @@ pub const Histogram = struct {
         // arbitrary values here).
         if (lowest_discernible > std.math.maxInt(u64) / 2) return error.InvalidArguments;
         if (highest_trackable < 2 * lowest_discernible) return error.InvalidArguments;
+        // unit_magnitude below is log2(lowest_discernible) truncated to a u5
+        // (max 31); reject values whose log2 wouldn't fit rather than let the
+        // @intCast panic on decoded/untrusted input.
+        if (lowest_discernible >= (1 << 32)) return error.InvalidArguments;
 
         // largest_value_with_single_unit_resolution = 2 * 10^sig_figs
         const largest_single_unit: u64 = 2 * std.math.pow(u64, 10, sig_figs);
@@ -732,6 +736,13 @@ test "init produces sane geometry" {
     try testing.expectEqual(@as(u64, 0), h.count());
 }
 
+test "init rejects a lowest_discernible whose log2 overflows unit_magnitude" {
+    try testing.expectError(
+        error.InvalidArguments,
+        Histogram.init(testing.allocator, 1 << 32, (1 << 32) * 4, 3),
+    );
+}
+
 test "record and count" {
     var h = try newDefault();
     defer h.deinit();
@@ -1108,6 +1119,13 @@ test "decodeBase64 errors (never panics) on malformed blobs" {
     // A lowest/highest pair whose validation math would overflow.
     {
         const b64 = try buildTestBlob(gpa, 3, std.math.maxInt(u64), std.math.maxInt(u64), &.{});
+        defer gpa.free(b64);
+        try testing.expectError(error.InvalidArguments, decodeBase64(gpa, b64));
+    }
+    // lowest_discernible whose log2 doesn't fit unit_magnitude's u5, but which
+    // clears every other check (see the `init` @intCast this used to panic on).
+    {
+        const b64 = try buildTestBlob(gpa, 3, 1 << 32, (1 << 32) * 4, &.{});
         defer gpa.free(b64);
         try testing.expectError(error.InvalidArguments, decodeBase64(gpa, b64));
     }

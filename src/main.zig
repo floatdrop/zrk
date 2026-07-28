@@ -239,9 +239,7 @@ fn readBody(arena: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
     if (std.mem.eql(u8, path, "-")) {
         var buf: [4096]u8 = undefined;
         var fr: Io.File.Reader = .init(.stdin(), io, &buf);
-        var aw: Io.Writer.Allocating = .init(arena);
-        _ = try fr.interface.streamRemaining(&aw.writer);
-        return aw.toOwnedSlice();
+        return fr.interface.allocRemaining(arena, .limited(max_body_bytes));
     }
     return Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_body_bytes));
 }
@@ -361,6 +359,8 @@ fn printUsageError(io: Io, err: cli.ParseError) !void {
         error.InvalidUrl => "zrk: invalid URL (expected http:// or https://)\n\n",
         error.InvalidHeader => "zrk: invalid header (expected 'Name: Value')\n\n",
         error.InvalidFormat => "zrk: invalid --format (expected 'text' or 'json')\n\n",
+        error.ZeroThreads => "zrk: threads (-t) must be greater than 0\n\n",
+        error.TooManyThreads => "zrk: threads (-t) exceeds the maximum this platform supports\n\n",
         error.ZeroConnections => "zrk: connections (-c) must be greater than 0\n\n",
         error.ZeroRate => "zrk: rate (-R) must be greater than 0\n\n",
         error.ZeroInterval => "zrk: --interval must be greater than 0\n\n",

@@ -119,11 +119,24 @@ pub const ParseError = error{
     InvalidUrl,
     InvalidHeader,
     InvalidFormat,
+    ZeroThreads,
+    TooManyThreads,
     ZeroConnections,
     ZeroRate,
     ZeroInterval,
     ZeroRefresh,
     OutOfMemory,
+};
+
+/// Upper bound on `--threads`: zio (the runtime we hand this straight to,
+/// via `.exact(cfg.threads)`) asserts the executor count fits in one id per
+/// host pointer width class and does not export that limit, so it's mirrored
+/// here rather than surfacing as an assertion failure — UB in our ReleaseFast
+/// builds — deep inside the runtime.
+const max_threads: u8 = switch (@sizeOf(usize)) {
+    4 => 32,
+    8 => 64,
+    else => @compileError("unsupported architecture"),
 };
 
 /// Result of parsing: a usable config, or a request to print help / version.
@@ -289,6 +302,8 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
         }
     }
 
+    if (cfg.threads == 0) return error.ZeroThreads;
+    if (cfg.threads > max_threads) return error.TooManyThreads;
     if (cfg.connections == 0) return error.ZeroConnections;
     if (cfg.rate == 0) return error.ZeroRate;
     // A ramp toward 0 req/s has no well-defined schedule; require a positive end.
@@ -490,6 +505,16 @@ test "zero interval is rejected" {
     // Zero timeout stays valid: it means "no response timeout".
     const cfg = (try parse(a, &[_][]const u8{ "--timeout", "0", "http://x/" })).config;
     try testing.expectEqual(@as(u64, 0), cfg.timeout_ns);
+}
+
+test "thread count is bounded" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectError(error.ZeroThreads, parse(a, &[_][]const u8{ "-t", "0", "http://x/" }));
+    try testing.expectError(error.TooManyThreads, parse(a, &[_][]const u8{ "-t", "255", "http://x/" }));
+    const cfg = (try parse(a, &[_][]const u8{ "-t", "1", "http://x/" })).config;
+    try testing.expectEqual(@as(u8, 1), cfg.threads);
 }
 
 test "deadline flag parses; defaults off" {
