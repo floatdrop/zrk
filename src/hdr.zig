@@ -389,24 +389,56 @@ pub const Histogram = struct {
     /// Fold the recorded counts into `out.len` equal-width log2 latency bins that
     /// tile `[1, highest_trackable]`, so a caller (the live spectrogram) can render
     /// a fixed-axis heatmap column without touching the bucket layout. `out` is
-    /// zeroed first; a value `v` maps to bin `floor(log2(v)/log2(highest)·out.len)`,
-    /// clamped to the last bin. Inverse of `log2BinEdge`. Total count is conserved.
+    /// zeroed first; bin `b` covers `[log2BinEdge(out.len, b), log2BinEdge(out.len,
+    /// b+1))`. Total count is conserved exactly.
+    ///
+    /// Each bucket's count is spread across the bins its *equivalent value range*
+    /// covers, in proportion to the overlap, rather than dropped whole onto the
+    /// bin holding the bucket's midpoint. The difference matters at the low end:
+    /// a bucket there is one `lowest_discernible` unit wide, so at 19µs it spans
+    /// ~7% of an octave while a bin spans ~2.5% — point-mapping would leave two
+    /// bins in three empty and the spectrogram would render a comb of stripes
+    /// that is an artifact of the axis rather than a feature of the latencies.
     pub fn binByLog2(self: *const Histogram, out: []u64) void {
         @memset(out, 0);
         if (out.len == 0) return;
-        const span = std.math.log2(@as(f64, @floatFromInt(self.highest_trackable)));
-        if (span <= 0) return;
-        const scale = @as(f64, @floatFromInt(out.len)) / span;
+        const axis = std.math.log2(@as(f64, @floatFromInt(self.highest_trackable)));
+        if (axis <= 0) return;
+        const scale = @as(f64, @floatFromInt(out.len)) / axis;
+        const top = out.len - 1;
         const s = self.touchedSpan() orelse return;
         var i: u32 = s.lo;
         while (i <= s.hi) : (i += 1) {
             const cnt = self.counts[i];
             if (cnt == 0) continue;
-            const v = self.medianEquivalentValue(self.valueFromIndex(i));
-            const l2 = std.math.log2(@as(f64, @floatFromInt(@max(v, 1))));
-            var b: usize = @intFromFloat(l2 * scale);
-            if (b >= out.len) b = out.len - 1;
-            out[b] += cnt;
+            // The bucket covers [lo_v, hi_v) in value space, hence [lo, hi) on
+            // the log2 bin axis.
+            const lo_v = @max(self.valueFromIndex(i), 1);
+            const hi_v = lo_v +| self.sizeOfEquivalentRange(lo_v);
+            const lo = @max(std.math.log2(@as(f64, @floatFromInt(lo_v))) * scale, 0);
+            const hi = @max(std.math.log2(@as(f64, @floatFromInt(hi_v))) * scale, lo);
+            const width = hi - lo;
+            const total: f64 = @floatFromInt(cnt);
+
+            // Hand each bin the rounded share of `cnt` that lies below its top
+            // edge, minus what the bins before it already took. Telescoping like
+            // this keeps the split exact: the last bin's cumulative share is
+            // `cnt`, so nothing is created or lost by rounding.
+            var placed: u64 = 0;
+            var b: usize = @intFromFloat(lo);
+            while (placed < cnt) : (b += 1) {
+                if (b >= top) {
+                    out[top] += cnt - placed;
+                    break;
+                }
+                const edge: f64 = @floatFromInt(b + 1);
+                const share: u64 = if (width <= 0 or edge >= hi)
+                    cnt
+                else
+                    @intFromFloat(@round(total * (edge - lo) / width));
+                out[b] += share - placed;
+                placed = share;
+            }
         }
     }
 
@@ -1132,23 +1164,57 @@ test "binByLog2 conserves count and separates two modes into ordered bins" {
     for (bins) |b| total += b;
     try testing.expectEqual(@as(u64, 12), total);
 
-    // Exactly two occupied bins, low mode strictly before the high mode.
-    var lo: ?usize = null;
-    var hi: ?usize = null;
-    var occupied: usize = 0;
-    for (bins, 0..) |b, i| if (b > 0) {
-        if (lo == null) lo = i;
-        hi = i;
-        occupied += 1;
-    };
-    try testing.expectEqual(@as(usize, 2), occupied);
-    try testing.expect(lo.? < hi.?);
-    try testing.expectEqual(@as(u64, 5), bins[lo.?]);
-    try testing.expectEqual(@as(u64, 7), bins[hi.?]);
+    // Two clusters, the low mode strictly before the high one with empty bins
+    // between. A bucket whose value range straddles a bin edge splits across
+    // both, so a mode is a short run of adjacent bins rather than always one.
+    var i: usize = 0;
+    while (i < bins.len and bins[i] == 0) i += 1;
+    const lo_start = i;
+    var lo_sum: u64 = 0;
+    while (i < bins.len and bins[i] > 0) : (i += 1) lo_sum += bins[i];
+    const lo_end = i - 1;
+    const gap = i;
+    while (i < bins.len and bins[i] == 0) i += 1;
+    try testing.expect(i > gap); // the modes don't touch
+    const hi_start = i;
+    var hi_sum: u64 = 0;
+    while (i < bins.len and bins[i] > 0) : (i += 1) hi_sum += bins[i];
+    const hi_end = i - 1;
+    while (i < bins.len) : (i += 1) try testing.expectEqual(@as(u64, 0), bins[i]);
 
-    // Each mode's value falls within its bin's [edge(b), edge(b+1)) latency range.
-    try testing.expect(h.log2BinEdge(512, lo.?) <= 100 and 100 < h.log2BinEdge(512, lo.? + 1));
-    try testing.expect(h.log2BinEdge(512, hi.?) <= 100_000 and 100_000 < h.log2BinEdge(512, hi.? + 1));
+    try testing.expectEqual(@as(u64, 5), lo_sum);
+    try testing.expectEqual(@as(u64, 7), hi_sum);
+
+    // Each mode's value falls within the [edge(first), edge(last+1)) latency
+    // range its bins cover.
+    try testing.expect(h.log2BinEdge(512, lo_start) <= 100 and 100 < h.log2BinEdge(512, lo_end + 1));
+    try testing.expect(h.log2BinEdge(512, hi_start) <= 100_000 and 100_000 < h.log2BinEdge(512, hi_end + 1));
+}
+
+test "binByLog2 spreads a bucket across every bin its value range covers" {
+    var h = try newDefault();
+    defer h.deinit();
+    // Tens of microseconds: one bucket is 1µs wide there, which spans several
+    // log2 bins at this axis resolution. Dropping each bucket's count onto a
+    // single bin would leave the bins between the recorded values empty, and
+    // the spectrogram would draw that comb as vertical stripes.
+    var v: u64 = 20;
+    while (v <= 60) : (v += 1) h.recordCount(v, 100);
+
+    var bins: [1024]u64 = undefined;
+    h.binByLog2(&bins);
+
+    var total: u64 = 0;
+    for (bins) |b| total += b;
+    try testing.expectEqual(h.total_count, total);
+
+    var lo: usize = 0;
+    while (bins[lo] == 0) lo += 1;
+    var hi: usize = bins.len - 1;
+    while (bins[hi] == 0) hi -= 1;
+    // The values are contiguous, so their bins are too: no holes in between.
+    try testing.expect(hi - lo >= 40);
+    for (bins[lo .. hi + 1]) |b| try testing.expect(b > 0);
 }
 
 test "log2BinEdge is monotonic and spans the configured range" {
