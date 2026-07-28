@@ -445,31 +445,48 @@ pub const Dashboard = struct {
         // repaint. Storage/render buffers stay sized to the spec_width maximum.
         const width = @max(@min(spec_width, self.term_cols -| 1), 1);
 
-        // Aggregate each row's storage bins into `width` display columns,
-        // tracking the global peak for a log-compressed intensity scale (so a
-        // smaller mode still shows rather than washing out next to the dominant
-        // one). Empty ring slots (before the waterfall fills) stay all-zero.
-        var cells: [spec_rows_max][spec_width]u64 = std.mem.zeroes([spec_rows_max][spec_width]u64);
-        var peak: u64 = 1;
+        // Resample each row's storage bins onto `width` display columns, tracking
+        // the global peak for a log-compressed intensity scale (so a smaller mode
+        // still shows rather than washing out next to the dominant one). Empty
+        // ring slots (before the waterfall fills) stay all-zero.
+        //
+        // A column is a weighted *average* of the bins around its center, not a
+        // sum over the bins it happens to straddle: `span` rarely divides
+        // `width`, so summing makes a column that covers two bins twice as hot
+        // as its one-bin neighbour and the picture bands into vertical stripes
+        // that move with the terminal size. The tent kernel spans one column
+        // (radius `colw`/2), widening to a full bin when a column is narrower
+        // than one, which interpolates instead of replicating when the framed
+        // range is upsampled. Bins outside the frame count as zeros, so the
+        // occupied range fades out at its edges rather than ending in a cliff.
+        var cells: [spec_rows_max][spec_width]f64 = std.mem.zeroes([spec_rows_max][spec_width]f64);
+        var peak: f64 = 0;
         if (have_data) {
+            const colw = @as(f64, @floatFromInt(span)) / @as(f64, @floatFromInt(width));
+            const radius = @max(colw / 2, 1.0);
             for (0..n) |r| {
                 const row = self.rowAt(r, n);
                 for (0..width) |x| {
-                    const lo = minb + x * span / width;
-                    // Advance at least one bin per column so upsampling a narrow
-                    // span leaves no artificial gaps; real gaps between modes
-                    // (empty bins) still read as empty columns.
-                    const hi = @max(lo + 1, minb + (x + 1) * span / width);
-                    var sum: u64 = 0;
-                    var b = lo;
-                    while (b < hi and b <= maxb) : (b += 1) sum += row[b];
+                    const center = @as(f64, @floatFromInt(minb)) + (@as(f64, @floatFromInt(x)) + 0.5) * colw;
+                    var acc: f64 = 0;
+                    var wsum: f64 = 0;
+                    var b: isize = @intFromFloat(@floor(center - radius));
+                    const last: isize = @intFromFloat(@ceil(center + radius));
+                    while (b <= last) : (b += 1) {
+                        const d = @abs(@as(f64, @floatFromInt(b)) + 0.5 - center);
+                        if (d >= radius) continue;
+                        const weight = 1 - d / radius;
+                        wsum += weight;
+                        if (b >= 0 and b < spec_bins) acc += @as(f64, @floatFromInt(row[@intCast(b)])) * weight;
+                    }
+                    const v = if (wsum > 0) acc / wsum else 0;
                     // Newest data sits on the bottom rows; older rows pad the top.
-                    cells[spec_rows_max - n + r][x] = sum;
-                    if (sum > peak) peak = sum;
+                    cells[spec_rows_max - n + r][x] = v;
+                    if (v > peak) peak = v;
                 }
             }
         }
-        const denom = std.math.log2(@as(f64, @floatFromInt(1 + peak)));
+        const denom = std.math.log2(1 + peak);
         const color_on = k.reset.len > 0; // theme active (TTY and not NO_COLOR)
         const hottest = heat_ramp.len - 1;
 
@@ -477,12 +494,12 @@ pub const Dashboard = struct {
         for (0..spec_rows_max) |r| {
             for (0..width) |x| {
                 const q = cells[r][x];
-                if (q == 0) {
+                if (q <= 0) {
                     try w.writeAll(" ");
                     continue;
                 }
                 const frac: f64 = if (denom > 0)
-                    std.math.clamp(std.math.log2(@as(f64, @floatFromInt(1 + q))) / denom, 0.0, 1.0)
+                    std.math.clamp(std.math.log2(1 + q) / denom, 0.0, 1.0)
                 else
                     1.0;
                 const stop = heat_ramp[@intFromFloat(@round(frac * @as(f64, @floatFromInt(hottest))))];
@@ -814,6 +831,83 @@ test "spectrogram renders a bimodal interval as two separated clusters" {
     const g1 = std.mem.indexOfScalar(u8, data_row, 0xE2) orelse return error.NoGlyph;
     const gap = std.mem.indexOfScalarPos(u8, data_row, g1, ' ') orelse return error.NoGap;
     try testing.expect(std.mem.indexOfScalarPos(u8, data_row, gap, 0xE2) != null);
+}
+
+test "spectrogram renders a dense interval as an unbroken gradient" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const cfg = cli.Config{ .url = try cli.parseUrl("http://127.0.0.1/"), .interval_ns = std.time.ns_per_s };
+    var dash_buf: [64]u8 = undefined;
+    var dash = Dashboard.init(io, &cfg, .empty, &dash_buf);
+    dash.colors = .{}; // disabled: cells are glyph-or-space with no SGR to parse
+    dash.term_cols = 120; // wider than spec_width, so the full 100 columns render
+
+    // One dense mode: a lognormal around 78µs, wide enough (20µs..300µs, ~2
+    // octaves more than the 100 columns can hold) that the framed bin range is
+    // downsampled onto the columns — the regime the issue's run was in.
+    var h = try stats.newHistogram(testing.allocator);
+    defer h.deinit();
+    var v: u64 = 20;
+    while (v <= 300) : (v += 1) {
+        const z = (@log(@as(f64, @floatFromInt(v))) - @log(78.0)) / 0.35;
+        h.recordCount(v, @intFromFloat(3.0e6 * @exp(-0.5 * z * z) / @as(f64, @floatFromInt(v))));
+    }
+    dash.pushSpecRow(&h);
+
+    var out = Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+    _ = try dash.drawSpectrogram(&out.writer, h.highest_trackable);
+
+    // The newest row is the last one carrying glyphs.
+    var it = std.mem.splitScalar(u8, out.written(), '\n');
+    var row: []const u8 = "";
+    while (it.next()) |ln| {
+        if (std.mem.indexOfScalar(u8, ln, 0xE2) != null) row = ln;
+    }
+
+    // Decode the row into one intensity level per column: a space is 0, and the
+    // four block glyphs (U+2591..U+2593, U+2588) climb from 1 to 4.
+    var level: [spec_width]u8 = undefined;
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < row.len) : (cols += 1) {
+        if (row[i] == ' ') {
+            level[cols] = 0;
+            i += 1;
+            continue;
+        }
+        level[cols] = switch (std.mem.readInt(u24, row[i..][0..3], .big)) {
+            0xE29691 => 1, // ░
+            0xE29692 => 2, // ▒
+            0xE29693 => 3, // ▓
+            0xE29688 => 4, // █
+            else => return error.UnexpectedGlyph,
+        };
+        i += 3;
+    }
+
+    // A single mode must render as a single run of occupied cells: no interior
+    // blanks. Bins finer than the histogram's resolution used to leave gaps
+    // there, drawing an unbroken distribution as a comb of stripes (#43).
+    var lo: usize = 0;
+    while (lo < cols and level[lo] == 0) lo += 1;
+    var hi: usize = cols - 1;
+    while (hi > lo and level[hi] == 0) hi -= 1;
+    try testing.expect(hi - lo > 20); // the mode spans most of the width
+    for (level[lo .. hi + 1]) |l| try testing.expect(l > 0);
+
+    // And it must render as one hill: intensity climbs to the peak, then falls.
+    // Summing whole bins per column made a column covering two of them twice as
+    // hot as its one-bin neighbour, which shows up here as a dip on the way up
+    // (or a bump on the way down).
+    var peak = lo;
+    for (level[lo .. hi + 1], lo..) |l, x| if (l > level[peak]) {
+        peak = x;
+    };
+    for (lo..peak) |x| try testing.expect(level[x] <= level[x + 1]);
+    for (peak..hi) |x| try testing.expect(level[x] >= level[x + 1]);
 }
 
 test "spectrogram reserves full height even before any data" {
