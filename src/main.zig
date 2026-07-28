@@ -239,9 +239,7 @@ fn readBody(arena: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
     if (std.mem.eql(u8, path, "-")) {
         var buf: [4096]u8 = undefined;
         var fr: Io.File.Reader = .init(.stdin(), io, &buf);
-        var aw: Io.Writer.Allocating = .init(arena);
-        _ = try fr.interface.streamRemaining(&aw.writer);
-        return aw.toOwnedSlice();
+        return fr.interface.allocRemaining(arena, .limited(max_body_bytes));
     }
     return Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_body_bytes));
 }
