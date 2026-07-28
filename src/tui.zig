@@ -94,6 +94,14 @@ pub const Dashboard = struct {
     /// Lines the previous frame drew — how far to move up before repainting.
     prev_lines: usize = 0,
 
+    /// Raised by the caller's signal watchers once a stop has been requested, so
+    /// the panel can report it *itself*. Nothing else may write to this terminal
+    /// while the panel is live: two lines printed under it (the old stderr
+    /// "interrupt received" notice) scroll the panel down without `prev_lines`
+    /// knowing, so the next repaint moves up too few lines, lands mid-panel and
+    /// leaves a duplicated header stranded above it.
+    stop_requested: ?*const std.atomic.Value(bool) = null,
+
     // Counter samples per frame, so displayed rates are measured over the
     // --interval stats window regardless of how fast --refresh redraws. A
     // per-frame delta at a 10ms refresh holds ~a handful of requests and
@@ -132,6 +140,12 @@ pub const Dashboard = struct {
 
     fn writer(self: *Dashboard) *Io.Writer {
         return &self.fw.interface;
+    }
+
+    /// Whether a signal has asked the run to stop (see `stop_requested`).
+    fn stopping(self: *const Dashboard) bool {
+        const flag = self.stop_requested orelse return false;
+        return flag.load(.monotonic);
     }
 
     /// Newest ring sample at least one --interval older than `now` — the base
@@ -258,10 +272,17 @@ pub const Dashboard = struct {
         // it toggles on a ~1s wall-clock phase (rather than the SGR blink
         // attribute, which most terminals ignore), and the cell stays one column
         // wide — a space while dark — so the clock never jitters. Once finished
-        // it settles to a static dim dot: the panel stays on screen as the run's
-        // record, and a still grey dot reads as "stopped", not "recording".
-        if (finished) {
-            try w.print("{s}●{s} ", .{ k.dim, k.reset });
+        // it settles to a static dim mark: the panel stays on screen as the
+        // run's record, and a still grey mark reads as "stopped", not
+        // "recording". The mark's *shape* says how the run ended — a dot when it
+        // ran its course, a cross when a signal cut it short — and the blink
+        // stops the moment a stop is requested, since the fleet is winding down
+        // from then on and "recording" would be a lie.
+        const stop_req = self.stopping();
+        if (finished or stop_req) {
+            const mark: []const u8 = if (stop_req) "✕" else "●";
+            const tint = if (stop_req and !finished) k.red else k.dim;
+            try w.print("{s}{s}{s} ", .{ tint, mark, k.reset });
         } else {
             const blink_on = (@as(u64, @intFromFloat(@max(elapsed_s, 0) * 2)) & 1) == 0;
             if (blink_on) try w.print("{s}●{s} ", .{ k.red, k.reset }) else try w.writeAll("  ");
@@ -322,6 +343,19 @@ pub const Dashboard = struct {
                 k.red, c.deadline_errors, k.reset,
                 k.dim, k.reset,           Dur.of(c.max_behind_ns / std.time.ns_per_us),
             });
+            lines += 1;
+        }
+        // The stop notice belongs *in* the panel, counted in `lines` like every
+        // other row: printed underneath it instead (as a stderr line) it would
+        // desync the in-place repaint. Joining a large fleet is not instant, so
+        // while it happens the hint also says how to give up waiting.
+        if (stop_req) {
+            try padTo(w, stat_col);
+            if (finished) {
+                try w.print("{s}stopped early — the numbers above are what was measured{s}\n", .{ k.dim, k.reset });
+            } else {
+                try w.print("{s}stopping — signal again to abort{s}\n", .{ k.dim, k.reset });
+            }
             lines += 1;
         }
         try w.writeAll("\n");
@@ -786,6 +820,59 @@ test "writeFinalSummary renders the compact plain summary to any writer" {
     // No deadline mode here, so neither overload line appears.
     try testing.expect(std.mem.indexOf(u8, text, "deadline misses") == null);
     try testing.expect(std.mem.indexOf(u8, text, "peak schedule lag") == null);
+}
+
+test "a requested stop shows on the panel without breaking its line accounting" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const cfg = cli.Config{ .url = try cli.parseUrl("http://127.0.0.1/") };
+    var dash_buf: [64]u8 = undefined;
+    var dash = Dashboard.init(io, &cfg, .empty, &dash_buf);
+    dash.colors = .{};
+    dash.term_cols = 120;
+
+    var snap: stats.Snapshot = .{ .hist = try stats.newHistogram(testing.allocator), .counters = .{} };
+    defer snap.deinit();
+    snap.hist.record(1000);
+    snap.counters.completed = 100;
+    snap.counters.recordStatus(200);
+
+    var stop = std.atomic.Value(bool).init(false);
+    dash.stop_requested = &stop;
+
+    // The whole point of the accounting: `prev_lines` is how far the *next*
+    // frame moves up, so a panel that writes more newlines than it reports
+    // repaints mid-panel and strands a duplicate header above itself. That is
+    // what the old stderr stop notice did, from outside the panel entirely.
+    var running = Io.Writer.Allocating.init(testing.allocator);
+    defer running.deinit();
+    const live = try dash.drawPanel(&running.writer, &snap, 100, 1000, 1.0, 30.0, false);
+    try testing.expectEqual(std.mem.count(u8, running.written(), "\n"), live);
+    try testing.expect(std.mem.indexOf(u8, running.written(), "✕") == null);
+
+    stop.store(true, .monotonic);
+    var stopping = Io.Writer.Allocating.init(testing.allocator);
+    defer stopping.deinit();
+    const cut = try dash.drawPanel(&stopping.writer, &snap, 100, 1000, 1.0, 30.0, false);
+    try testing.expectEqual(std.mem.count(u8, stopping.written(), "\n"), cut);
+    // The recording dot gives way to a cross, and the notice lands inside the
+    // panel — one line taller than the same frame with no stop pending.
+    try testing.expect(std.mem.indexOf(u8, stopping.written(), "✕") != null);
+    try testing.expect(std.mem.indexOf(u8, stopping.written(), "●") == null);
+    try testing.expect(std.mem.indexOf(u8, stopping.written(), "stopping — signal again to abort") != null);
+    try testing.expectEqual(live + 1, cut);
+
+    // Settled: the panel stays as the run's record, so the cross persists and
+    // the hint gives way to what the numbers mean.
+    var final_out = Io.Writer.Allocating.init(testing.allocator);
+    defer final_out.deinit();
+    const done = try dash.drawPanel(&final_out.writer, &snap, 100, 1000, 1.0, 30.0, true);
+    try testing.expectEqual(std.mem.count(u8, final_out.written(), "\n"), done);
+    try testing.expect(std.mem.indexOf(u8, final_out.written(), "✕") != null);
+    try testing.expect(std.mem.indexOf(u8, final_out.written(), "signal again") == null);
+    try testing.expect(std.mem.indexOf(u8, final_out.written(), "stopped early") != null);
 }
 
 test "spectrogram renders a bimodal interval as two separated clusters" {

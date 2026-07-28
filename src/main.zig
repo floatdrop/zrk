@@ -88,8 +88,13 @@ pub fn main(init: std.process.Init) !void {
     // should do here.
     var interrupt: Interrupt = .{};
     var sig_group: Io.Group = .init;
-    const watching = installInterrupt(io, &sig_group, &interrupt);
+    // With a live panel the terminal belongs to the dashboard: the watchers stay
+    // silent and the panel reports the stop itself, since a stderr notice
+    // printed under the panel scrolls it out from under the repaint accounting.
+    const live_panel = progress.dash != null and dash.tui;
+    const watching = installInterrupt(io, &sig_group, &interrupt, !live_panel);
     defer if (watching) sig_group.cancel(io);
+    if (watching) dash.stop_requested = &interrupt.flag;
 
     const result = runner.run(arena, io, &cfg, frame_ns, ctx, cb, if (watching) &interrupt.flag else null) catch |err| {
         try printRunError(io, err);
@@ -145,7 +150,10 @@ const Interrupt = struct {
 /// a graceful stop that is evidently not arriving. Returns false if no watcher
 /// could be installed, in which case the default disposition stays and a signal
 /// kills the process as before.
-fn installInterrupt(io: Io, group: *Io.Group, it: *Interrupt) bool {
+///
+/// `notify` writes the stop notice to stderr; pass false when a live dashboard
+/// owns the terminal, which shows the stop on the panel instead.
+fn installInterrupt(io: Io, group: *Io.Group, it: *Interrupt, notify: bool) bool {
     var any = false;
     // SIGTERM matters as much as SIGINT here: `docker stop` and most CI
     // cancellations send it, and without this a containerized run loses
@@ -154,7 +162,7 @@ fn installInterrupt(io: Io, group: *Io.Group, it: *Interrupt) bool {
         .{ .kind = .interrupt, .code = 130, .notice = "\nzrk: interrupt received, stopping (Ctrl-C again to abort)\n" },
         .{ .kind = .terminate, .code = 143, .notice = "\nzrk: SIGTERM received, stopping (signal again to abort)\n" },
     }) |spec| {
-        group.concurrent(io, watchSignal, .{ io, spec, it }) catch continue;
+        group.concurrent(io, watchSignal, .{ io, spec, it, notify }) catch continue;
         any = true;
     }
     return any;
@@ -166,7 +174,7 @@ const SignalSpec = struct {
     notice: []const u8,
 };
 
-fn watchSignal(io: Io, spec: SignalSpec, it: *Interrupt) void {
+fn watchSignal(io: Io, spec: SignalSpec, it: *Interrupt, notify: bool) void {
     var sig = zio.Signal.init(spec.kind) catch return;
     defer sig.deinit();
     while (true) {
@@ -176,7 +184,7 @@ fn watchSignal(io: Io, spec: SignalSpec, it: *Interrupt) void {
         if (it.claimed.swap(true, .acq_rel)) std.process.exit(spec.code);
         it.exit_code.store(spec.code, .monotonic);
         it.flag.store(true, .monotonic);
-        writeAll(io, .stderr(), spec.notice) catch {};
+        if (notify) writeAll(io, .stderr(), spec.notice) catch {};
     }
 }
 

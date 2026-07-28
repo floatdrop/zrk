@@ -174,14 +174,10 @@ pub fn run(
     var next_frame: i128 = start.nanoseconds + frame_ns;
     var interrupted = false;
     while (true) {
-        if (interrupt) |flag| if (flag.load(.monotonic)) {
-            interrupted = true;
-            break;
-        };
         const before = Io.Timestamp.now(io, .awake);
         if (before.nanoseconds >= end.nanoseconds) break;
         var next_wake = @min(@min(next_frame, next_row), end.nanoseconds);
-        // Bound the sleep so the interrupt check above runs on a fixed cadence
+        // Bound the sleep so the interrupt check below runs on a fixed cadence
         // rather than only at the next frame/row deadline.
         if (interrupt != null) next_wake = @min(next_wake, before.nanoseconds + interrupt_poll_ns);
         if (next_wake > before.nanoseconds) {
@@ -202,8 +198,16 @@ pub fn run(
         // The wake at `end` flushes both consumers so the last partial window
         // is never dropped.
         const at_end = t.nanoseconds >= end.nanoseconds;
+        // A raised interrupt ends the run here rather than at the top of the
+        // next pass, so it takes the same last-frame flush as `at_end` does.
+        // Stopping is not instant — the fleet still has to be joined — and
+        // without that frame a live dashboard sits frozen on its last
+        // pre-interrupt paint, giving no sign the signal even arrived.
+        if (interrupt) |flag| if (flag.load(.monotonic)) {
+            interrupted = true;
+        };
         const tick: Tick = .{
-            .frame = at_end or t.nanoseconds >= next_frame,
+            .frame = at_end or interrupted or t.nanoseconds >= next_frame,
             .row = at_end or t.nanoseconds >= next_row,
         };
         // A hair-early sleep return crosses no deadline: sleep again rather
@@ -217,7 +221,7 @@ pub fn run(
         if (progress) |callback| {
             callback(progress_context, &snap, t.nanoseconds, elapsed_s, total_s, tick);
         }
-        if (at_end) break;
+        if (at_end or interrupted) break;
     }
 
     // Signal stop, then cancel: connections idling between paced sends
