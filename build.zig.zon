@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#3566a3a8ca706e90de0ef1e1c46226ec4464f659",
-            .hash = "zio-0.16.0-xHbVVDxFJADhW5CgWRdQmPa8bg_YrOAiPFHTKGFq8jwk",
+            .url = "git+https://github.com/zoxy-io/zio?ref=fix/cancel-sqe-exhaustion#87db53bdc76c66a95da7dfc5e6ed313b86e2bcbb",
+            .hash = "zio-0.16.0-xHbVVD5KJABBZ_JZWYUgHatZ65KMm2uCSto03fyE-GY8",
         },
     },
     .paths = .{
