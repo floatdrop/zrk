@@ -7,13 +7,17 @@
 [![CI](https://github.com/zoxy-io/zrk/actions/workflows/ci.yml/badge.svg)](https://github.com/zoxy-io/zrk/actions/workflows/ci.yml)
 
 A constant/linear throughput HTTP load generator — a Zig 0.16 rewrite of
-[wrk2](https://github.com/giltene/wrk2), with a **live in-terminal dashboard**
-of test progress.
+[wrk2](https://github.com/giltene/wrk2) that paces every send in
+**nanoseconds instead of wrk2's millisecond-grain scheduler**, plus a live
+in-terminal dashboard of test progress.
 
 Like wrk2, zrk generates load at a *fixed* request rate and reports latency
 **corrected for coordinated omission** via an HdrHistogram, so tail latencies
-aren't hidden when the server falls behind. Unlike wrk2, zrk continuously
-renders the latency percentile spectrum and a p99 sparkline while the test runs.
+aren't hidden when the server falls behind. Unlike wrk2, that correction isn't
+riding on a scheduler that rounds every wait up to the next whole millisecond
+— see [Why zrk is more accurate than wrk2](#why-zrk-is-more-accurate-than-wrk2)
+below. zrk also continuously renders the latency percentile spectrum and a
+p99 sparkline while the test runs.
 
 ## Why coordinated-omission correction?
 
@@ -24,6 +28,37 @@ paces each connection to a fixed schedule and measures every request's latency
 from the time it *should* have been sent. If the server stalls, backlogged
 requests accrue latency against their intended send time — the stall is
 captured, not smoothed away.
+
+## Why zrk is more accurate than wrk2
+
+Coordinated-omission correction is only as precise as the clock underneath
+it, and wrk2's clock has a floor.
+
+wrk2's event loop (`ae.c`, forked from Redis) drives an epoll wait and a timer
+wheel that both resolve to whole milliseconds. Its per-request pacing computes
+the exact microsecond wait until the next scheduled send
+(`usec_to_next_send` in `wrk.c`), but then converts that into a timer delay
+with:
+
+```c
+int msec_to_wait = round((time_usec_to_wait / 1000.0L) + 0.5);
+```
+
+That always rounds *up* to the next whole millisecond — a wait of 1 µs and a
+wait of 999 µs both become a 1 ms wait. Because wrk2 correctly measures
+latency from the *scheduled* send time (that's the coordinated-omission fix),
+this scheduling overshoot isn't discarded — it lands directly in the recorded
+latency of every sample that wasn't already overdue. The overshoot is uniform
+on (0 ms, 1 ms], averaging ~0.5 ms: noise from the tool itself, not the
+server, and indistinguishable from it in the report. At the sub-millisecond
+latencies a fast service actually produces, that's not a rounding error —
+it's frequently larger than the number being measured.
+
+zrk's schedule (`src/pace.zig`) is a closed-form nanosecond offset per
+connection send index, computed directly from the target rate (or ramp),
+and each connection sleeps to it via [zio](https://github.com/lalinsky/zio)'s
+io_uring runtime (`io.sleep(Io.Duration.fromNanoseconds(...))`). There is no
+tick to round to.
 
 ## Installation
 
