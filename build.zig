@@ -91,6 +91,12 @@ pub fn build(b: *std.Build) void {
     // `cli.zig` checks the README's usage block against the real help text.
     // `@embedFile` cannot escape the module root, so the file arrives as a named
     // import instead.
+    //
+    // Added to both modules, because `main.zig` reaches `cli.zig` by file
+    // import rather than through the `zrk` module — so it is compiled into the
+    // executable's root module too, and an import given to only one of them is
+    // missing from the other. Every other dependency here is already listed
+    // twice for exactly that reason; this one was not, and CI caught it.
     mod.addAnonymousImport("readme", .{ .root_source_file = b.path("README.md") });
 
     // A standing check that the dependency options above actually applied.
@@ -120,9 +126,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
     linkCrypto(exe.root_module, boringssl);
+    exe.root_module.addAnonymousImport("readme", .{ .root_source_file = b.path("README.md") });
     b.installArtifact(exe);
 
     // Type-check without linking.
+    //
+    // Does not cover `test` blocks: an object has no test runner, so their
+    // bodies are never analysed. An import used only inside a test passes this
+    // and fails `zig build test` — which is exactly how the `readme` import
+    // above reached CI.
     //
     // `zig build` needs libcrypto, which means building BoringSSL — minutes,
     // and impossible in a sandbox that cannot reach the two non-GitHub hosts
