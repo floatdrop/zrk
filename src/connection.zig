@@ -223,13 +223,28 @@ pub fn run(p: *Params) void {
         var plain_writer: net.Stream.Writer = undefined;
         if (p.is_tls) {
             const ts = p.tls_state.?;
-            ts.handshake(io, p.allocator, stream, p.host, p.insecure, p.ca_store) catch {
+            // Offer `h2` only when this run speaks it. A server that answers
+            // `http/1.1` to an `h2` offer is a real thing to meet, so the
+            // negotiated protocol is checked below rather than assumed.
+            const alpn = if (p.http2) tlsmod.alpn_http2 else tlsmod.alpn_http1;
+            ts.handshake(io, p.allocator, stream, p.host, p.insecure, p.ca_store, alpn) catch {
                 // A failed handshake counts as a connect error; try again later.
                 noteError(p, .connect);
                 stream.close(io);
                 io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
                 continue;
             };
+            // What the peer actually chose. `--http2` against a server that
+            // does not speak it would otherwise send an HTTP/2 preface into an
+            // HTTP/1.1 connection and report the target as broken — which is
+            // exactly the failure mode the cleartext-only guard existed to
+            // prevent, now that ALPN makes the question answerable.
+            if (p.http2 and !alpnIs(ts.negotiatedAlpn(), "h2")) {
+                noteError(p, .connect);
+                stream.close(io);
+                io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
+                continue;
+            }
             app_reader = ts.reader();
             app_writer = ts.writer();
         } else {
@@ -402,10 +417,10 @@ fn performWork(
 ) WorkResult {
     if (session) |active| return performWorkHttp2(p, active);
     app_writer.writeAll(p.request) catch return .write_failed;
+    // One flush is enough: ztls-std's writer encrypts *and* writes the records
+    // to the socket handle itself, where `std.crypto.tls` only encrypted into
+    // the socket writer's buffer and needed a second flush behind it.
     app_writer.flush() catch return .write_failed;
-    // For TLS the app writer only encrypts into the socket writer's buffer; the
-    // underlying stream writer must be flushed to actually send the ciphertext.
-    if (p.is_tls) p.tls_state.?.swriter.interface.flush() catch return .write_failed;
     const resp = httpmod.parseResponse(app_reader, p.method) catch return .read_failed;
     return .{ .ok = resp };
 }
@@ -427,6 +442,13 @@ fn performWorkHttp2(p: *Params, session: *h2conn.Session) WorkResult {
         error.Protocol, error.TooLarge => return .read_failed,
     };
     return .{ .ok = resp };
+}
+
+/// Whether ALPN settled on `want`. Null means the peer selected nothing, which
+/// for an `h2` offer is a refusal rather than a default.
+fn alpnIs(selected: ?[]const u8, want: []const u8) bool {
+    const chosen = selected orelse return false;
+    return std.mem.eql(u8, chosen, want);
 }
 
 fn now(io: Io) Io.Timestamp {

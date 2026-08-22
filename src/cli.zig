@@ -81,13 +81,17 @@ pub const Config = struct {
     /// Speak HTTP/2 with prior knowledge (RFC 9113 section 3.4) instead of
     /// HTTP/1.1.
     ///
-    /// Prior knowledge means h2c: no ALPN and no upgrade dance, so the target
-    /// has to be a cleartext server that already speaks h2 — which is what a
-    /// benchmark target behind a terminator usually is. One request is in
-    /// flight per connection either way, so `-c`, the pacing, and every latency
-    /// number keep exactly their HTTP/1.1 meaning; only the wire format
-    /// changes. Multiplexing is a separate question about what concurrency
-    /// means for a coordinated-omission-corrected generator (zoxy-io/zrk#21).
+    /// Over cleartext this is prior knowledge (h2c) — no upgrade dance, so the
+    /// target must already speak h2, which a benchmark target behind a
+    /// terminator generally does. Over TLS it is ALPN, and a server that
+    /// declines `h2` fails the connection rather than being benchmarked over a
+    /// protocol nobody asked for.
+    ///
+    /// One request is in flight per connection either way, so `-c`, the pacing,
+    /// and every latency number keep exactly their HTTP/1.1 meaning; only the
+    /// wire format changes. Multiplexing is a separate question about what
+    /// concurrency means for a coordinated-omission-corrected generator
+    /// (zoxy-io/zrk#21).
     http2: bool = false,
     /// Skip TLS certificate verification.
     insecure: bool = false,
@@ -136,7 +140,6 @@ pub const ParseError = error{
     ZeroRate,
     ZeroInterval,
     ZeroRefresh,
-    Http2RequiresCleartext,
     OutOfMemory,
 };
 
@@ -186,9 +189,9 @@ pub const usage =
     \\                            lines                          (default 1s)
     \\      --refresh     <T>     Live dashboard redraw rate     (default 80ms)
     \\      --latency             Print full latency spectrum in the final report
-    \\      --http2               Speak HTTP/2 with prior knowledge (h2c).
-    \\                            Cleartext only for now: no ALPN, so an https
-    \\                            URL still negotiates HTTP/1.1
+    \\      --http2               Speak HTTP/2. Cleartext uses prior knowledge
+    \\                            (h2c); https negotiates it over ALPN and
+    \\                            fails the connection if the server declines
     \\  -k, --insecure            Skip TLS certificate verification
     \\      --plain               Append-only output instead of a live dashboard
     \\
@@ -334,15 +337,6 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
     const raw_url = url_arg orelse return error.MissingUrl;
     cfg.url = try parseUrl(raw_url);
 
-    // Refused rather than attempted. HTTP/2 over TLS is chosen by ALPN (RFC
-    // 9113 section 3.2), and the TLS client this binary links — `std.crypto.tls`
-    // — has no ALPN at all. Without it the server negotiates HTTP/1.1 and we
-    // would send an h2 connection preface into an h1 connection: the run would
-    // fail in a way that looks like the *target* misbehaving, which is the
-    // worst outcome for a measurement tool. Lifting this is the ztls decision
-    // in zoxy-io/zrk#21, and it is a distribution question rather than an
-    // HTTP/2 one.
-    if (cfg.http2 and cfg.url.isTls()) return error.Http2RequiresCleartext;
     cfg.headers = try headers.toOwnedSlice(arena);
     return .{ .config = cfg };
 }
