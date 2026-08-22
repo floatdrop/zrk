@@ -240,6 +240,26 @@ jobs:
           git commit -am "zrk: update to $version"
           git push
 
+      # A guard that fails closed can fail *silently*: if `dry` were ever
+      # anything but the 'false' those steps test for, a real release would
+      # skip both of them and still report success — a green run that shipped
+      # nothing. So check the outcome rather than trusting the condition.
+      #
+      # This one is deliberately `!= 'true'`: erring towards running a check is
+      # the safe direction, the opposite of erring towards publishing.
+      - name: Verify the release was published
+        if: needs.version.outputs.dry != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.version.outputs.tag }}"
+          gh release view "$tag" --json assets --jq '.assets[].name' | tee assets.txt
+          count=$(grep -c '\.tar\.gz$' assets.txt)
+          [ "$count" -eq 4 ] || { echo "expected 4 archives on $tag, found $count"; exit 1; }
+          grep -qx 'SHA256SUMS.txt' assets.txt || { echo "no SHA256SUMS.txt on $tag"; exit 1; }
+          echo "$tag published with 4 archives and checksums"
+
       - name: Dry run summary
         if: needs.version.outputs.dry == 'true'
         run: |
