@@ -365,15 +365,6 @@ fn printUsageError(io: Io, err: cli.ParseError) !void {
         error.ZeroRate => "zrk: rate (-R) must be greater than 0\n\n",
         error.ZeroInterval => "zrk: --interval must be greater than 0\n\n",
         error.ZeroRefresh => "zrk: --refresh must be greater than 0\n\n",
-        error.Http2RequiresCleartext =>
-            \\zrk: --http2 needs an http:// URL
-            \\
-            \\HTTP/2 over TLS is selected by ALPN, and the TLS client this binary
-            \\links does not implement it. Point --http2 at a cleartext h2c
-            \\endpoint, or drop --http2 to benchmark the https URL over HTTP/1.1.
-            \\
-            \\
-        ,
         error.OutOfMemory => "zrk: out of memory\n\n",
     };
     try writeAll(io, .stderr(), msg);

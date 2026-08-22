@@ -40,6 +40,34 @@
             .url = "git+https://github.com/zoxy-io/h2#ce82b9a886435d8fdd53e1a8cfbe72ed918fb53e",
             .hash = "h2-0.0.0--ngLtzZFBgCrbAucjP1hgw2-vJ2K12mf-04oR-EdzitD",
         },
+        // libcrypto for ztls, built by Zig rather than found on the system.
+        //
+        // ztls declares `linkSystemLibrary("crypto")`, which pkg-config would
+        // normally satisfy — but pkg-config only works when the host is the
+        // target, which is why zoxy builds natively on one runner per target
+        // and lost cross-compilation when it gained this dependency. A Zig-built
+        // BoringSSL linked as an artifact keeps zrk's single-runner
+        // cross-compile: proven for all four remaining targets on the
+        // `ztls-probe` branch, aarch64 included.
+        .boringssl = .{
+            .url = "git+https://github.com/allyourcodebase/boringssl#ec7cca75cbf5381ba4a9e111d1f12236f8f2bd6a",
+            .hash = "boringssl-0.20260526.0-EhtkNaI5AAAUWRtpFwiFhqdvxjAMMWkcx-iHkKIppGBV",
+        },
+        // TLS 1.3, for ALPN and therefore for HTTP/2 over TLS (#21).
+        //
+        // Pinned to `zoxy-tls`, the line zoxy audits and pins rather than
+        // `main`, so both consumers are on the same audited snapshot. It
+        // carries zoxy-io/ztls#2, which exposes the `std.Io` integration as a
+        // module — without it that adapter is a subdirectory no `zig fetch` can
+        // reach, and zrk's only options were vendoring 1177 lines of it or
+        // writing a second one.
+        //
+        // ztls is Linux and macOS only by design; the Windows release targets
+        // were dropped for it in 5a36623.
+        .ztls = .{
+            .url = "git+https://github.com/zoxy-io/ztls?ref=zoxy-tls#03c246477370d83bfc38d5168250e10fb235f358",
+            .hash = "ztls-0.0.0-SHHDXrvzFgAxDlPTWEEam3B2YclV_S0hHpOrD3qGFnEp",
+        },
     },
     .paths = .{
         "build.zig",

@@ -29,6 +29,53 @@ pub fn build(b: *std.Build) void {
     build_info.addOption([]const u8, "version", manifest.version);
     const build_info_mod = build_info.createModule();
 
+    // TLS, and the libcrypto under it.
+    //
+    // The three lines below are what the `ztls-probe` branch cost six CI runs
+    // to establish, and none of them is obvious. On a native build pkg-config
+    // supplies all three invisibly through `linkSystemLibrary("crypto")`; a
+    // cross-build has no pkg-config, so each becomes explicit:
+    //
+    //   1. a library search path, so ztls's `linkSystemLibrary` finds the
+    //      archive at all;
+    //   2. an include path on **ztls's own module**, because include paths are
+    //      per-module and the `@cImport` of `openssl/base.h` lives there, not
+    //      here;
+    //   3. `bcm` as well as `crypto` — modern BoringSSL splits the primitives
+    //      into a second archive that declares no dependency on the first, and
+    //      omitting it leaves 236 undefined `BN_*` symbols.
+    const boringssl = b.dependency("boringssl", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ztls_dep = b.dependency("ztls", .{
+        .target = target,
+        .optimize = optimize,
+        .@"crypto-backend" = @as([]const u8, "boringssl"),
+        // We supply libcrypto, so pkg-config must not. Left on, it injects the
+        // system OpenSSL's include path ahead of BoringSSL's, `openssl/base.h`
+        // resolves to one and its neighbours to the other, and the C import
+        // dies on typedef collisions — but only on machines where pkg-config
+        // knows about OpenSSL, so it passes CI and breaks on a laptop.
+        .@"crypto-pkg-config" = false,
+    });
+    const ztls_core = ztls_dep.module("ztls");
+    ztls_core.addIncludePath(boringssl.namedLazyPath("ssl_include"));
+    const ztls_std = ztls_dep.module("ztls_std");
+
+    // Every artifact that reaches `src/tls.zig` needs both archives and the
+    // search path; they always travel together, so they are set in one place
+    // rather than repeated per artifact.
+    const linkCrypto = struct {
+        fn apply(module: *std.Build.Module, bssl: *std.Build.Dependency) void {
+            const crypto = bssl.artifact("crypto");
+            module.addLibraryPath(crypto.getEmittedBinDirectory());
+            module.linkLibrary(crypto);
+            module.linkLibrary(bssl.artifact("bcm"));
+            module.link_libc = true;
+        }
+    }.apply;
+
     // The reusable library module: embedders `@import("zrk")` this.
     const mod = b.addModule("zrk", .{
         .root_source_file = b.path("src/root.zig"),
@@ -37,8 +84,20 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_info", .module = build_info_mod },
             .{ .name = "zio", .module = zio.module("zio") },
             .{ .name = "h2", .module = h2.module("h2") },
+            .{ .name = "ztls_std", .module = ztls_std },
         },
     });
+    linkCrypto(mod, boringssl);
+    // `cli.zig` checks the README's usage block against the real help text.
+    // `@embedFile` cannot escape the module root, so the file arrives as a named
+    // import instead.
+    //
+    // Added to both modules, because `main.zig` reaches `cli.zig` by file
+    // import rather than through the `zrk` module — so it is compiled into the
+    // executable's root module too, and an import given to only one of them is
+    // missing from the other. Every other dependency here is already listed
+    // twice for exactly that reason; this one was not, and CI caught it.
+    mod.addAnonymousImport("readme", .{ .root_source_file = b.path("README.md") });
 
     // A standing check that the dependency options above actually applied.
     const pin_tests = b.addTest(.{
@@ -62,10 +121,32 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_info", .module = build_info_mod },
                 .{ .name = "zio", .module = zio.module("zio") },
                 .{ .name = "h2", .module = h2.module("h2") },
+                .{ .name = "ztls_std", .module = ztls_std },
             },
         }),
     });
+    linkCrypto(exe.root_module, boringssl);
+    exe.root_module.addAnonymousImport("readme", .{ .root_source_file = b.path("README.md") });
     b.installArtifact(exe);
+
+    // Type-check without linking.
+    //
+    // Does not cover `test` blocks: an object has no test runner, so their
+    // bodies are never analysed. An import used only inside a test passes this
+    // and fails `zig build test` — which is exactly how the `readme` import
+    // above reached CI.
+    //
+    // `zig build` needs libcrypto, which means building BoringSSL — minutes,
+    // and impossible in a sandbox that cannot reach the two non-GitHub hosts
+    // its package pulls from. An object needs no libraries, so this answers
+    // "does the Zig compile" in seconds, which is the question most edits
+    // actually raise.
+    const check = b.addObject(.{
+        .name = "zrk-check",
+        .root_module = exe.root_module,
+    });
+    b.step("check", "Type-check without linking (no libcrypto needed)")
+        .dependOn(&check.step);
 
     // `zig build run -- <args>` runs the installed binary.
     const run_step = b.step("run", "Run the app");

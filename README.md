@@ -92,9 +92,12 @@ zig build test            # run the unit + integration tests
 ## Usage
 
 ```
-zrk [options] <url>
+zrk — constant-throughput HTTP load generator
 
-  -t, --threads     <B>     Total number of threads to execute load (default 2)
+Usage: zrk [options] <url>
+
+Options:
+  -t, --threads     <N>     Total number of threads to execute load (default 2)
   -c, --connections <N>     Total connections to keep open (default 10)
   -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
   -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps
@@ -109,17 +112,20 @@ zrk [options] <url>
                             scheduled send: a too-stale request is shed
                             (failed as a `deadline` error, not sent or
                             recorded) before sending (0 = off)
-      --deadline-abort      Also abort in-flight requests past the deadline.
-                            Resets the connection per miss and churns under
-                            saturation; off by default
+      --deadline-abort      Also abort in-flight requests past the
+                            deadline. Resets the connection per miss and
+                            churns under saturation; off by default
       --interval    <T>     Stats window: --timeseries rows and --plain
                             lines                          (default 1s)
       --refresh     <T>     Live dashboard redraw rate     (default 80ms)
       --latency             Print full latency spectrum in the final report
+      --http2               Speak HTTP/2. Cleartext uses prior knowledge
+                            (h2c); https negotiates it over ALPN and
+                            fails the connection if the server declines
   -k, --insecure            Skip TLS certificate verification
       --plain               Append-only output instead of a live dashboard
 
-  Reporting:
+Reporting:
       --format  <text|json> Final report format            (default text)
   -o, --output      <FILE>  Write the final report to FILE (default stdout)
       --hdr         <FILE>  Also write the HdrHistogram percentile
@@ -129,12 +135,12 @@ zrk [options] <url>
       --timeseries-histogram  Add each interval's full latency histogram
                             (HdrHistogram base64) to every --timeseries row
       --no-record-timeouts  Drop wire-timed-out requests from the latency
-                            histogram (default: record them, so the tail isn't
-                            truncated). --deadline misses are never recorded.
+                            histogram (default: record them). Independent
+                            of --deadline misses, which are never recorded.
 
-  CI gates (exit code 3 on breach):
+CI gates (exit code 3 on breach):
       --slo-p99     <T>     Fail if final p99 latency exceeds T
-      --max-error-rate <F>  Fail if error rate exceeds F (e.g. 0.01 or 1%)
+      --max-error-rate <F>  Fail if error rate exceeds F (0..1)
 
   -h, --help                Show this help
       --version             Show version
