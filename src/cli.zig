@@ -732,3 +732,25 @@ test "rate parses scalar and ramp forms" {
     try testing.expectEqual(@as(?u64, 5000), attached.rate_end);
     try testing.expectError(error.ZeroRate, parse(a, &[_][]const u8{ "-R", "100:0", "http://x/" }));
 }
+
+test "the README's usage block is the real help text" {
+    // The README duplicated this by hand, and drifted: `--http2` was missing
+    // entirely, `--threads` took `<B>` where the program says `<N>`, and three
+    // descriptions had diverged in wording. Every one of those is a promise the
+    // binary does not keep.
+    //
+    // Comparing them is cheaper than remembering. `@embedFile` reads the README
+    // at compile time, so a change to either side that leaves them different
+    // fails the build rather than shipping documentation for a program that
+    // does not exist.
+    const readme = @embedFile("readme");
+
+    const opening = "## Usage\n\n```\n";
+    const start = (std.mem.indexOf(u8, readme, opening) orelse
+        return error.UsageSectionMissing) + opening.len;
+    const rest = readme[start..];
+    const end = std.mem.indexOf(u8, rest, "```") orelse return error.UsageBlockUnterminated;
+    const documented = std.mem.trimEnd(u8, rest[0..end], "\n");
+
+    try std.testing.expectEqualStrings(std.mem.trimEnd(u8, usage, "\n"), documented);
+}

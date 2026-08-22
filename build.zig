@@ -88,6 +88,10 @@ pub fn build(b: *std.Build) void {
         },
     });
     linkCrypto(mod, boringssl);
+    // `cli.zig` checks the README's usage block against the real help text.
+    // `@embedFile` cannot escape the module root, so the file arrives as a named
+    // import instead.
+    mod.addAnonymousImport("readme", .{ .root_source_file = b.path("README.md") });
 
     // A standing check that the dependency options above actually applied.
     const pin_tests = b.addTest(.{
