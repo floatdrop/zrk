@@ -43,13 +43,17 @@ jobs:
           mkdir -p dist
 
           # zig-target : release-archive-label
+          #
+          # Linux and macOS only. The Windows targets were dropped in favour of
+          # adopting ztls for TLS, which is Linux and macOS by design — its
+          # `src/entropy.zig` is an outright `@compileError` anywhere else, and
+          # its README scopes it to "TLS 1.3 only, on Linux and macOS … no
+          # Windows portability layer". See zoxy-io/zrk#21.
           targets="
             x86_64-linux-musl:x86_64-linux
             aarch64-linux-musl:aarch64-linux
             x86_64-macos:x86_64-macos
             aarch64-macos:aarch64-macos
-            x86_64-windows-gnu:x86_64-windows
-            aarch64-windows-gnu:aarch64-windows
           "
           for pair in $targets; do
             zig_t="${pair%%:*}"
@@ -57,14 +61,7 @@ jobs:
             echo "::group::$label ($zig_t)"
             nix develop --command zig build \
               -Dtarget="$zig_t" -Doptimize=ReleaseFast --prefix "out/$label"
-            case "$zig_t" in
-              *windows*)
-                zip -j "dist/zrk-$version-$label.zip" "out/$label/bin/zrk.exe"
-                ;;
-              *)
-                tar czf "dist/zrk-$version-$label.tar.gz" -C "out/$label/bin" zrk
-                ;;
-            esac
+            tar czf "dist/zrk-$version-$label.tar.gz" -C "out/$label/bin" zrk
             echo "::endgroup::"
           done
 
