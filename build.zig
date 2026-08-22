@@ -11,6 +11,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The HTTP/2 frame codec and HPACK, shared with zoxy. `assertions = false`
+    // is deliberate and is the whole reason that option exists: h2's checks are
+    // on by default because zoxy points it at the open internet, and zrk is a
+    // latency-measuring tool whose pitch is not injecting client-side noise
+    // into the measurement. See zoxy-io/h2#6.
+    const h2 = b.dependency("h2", .{
+        .target = target,
+        .optimize = optimize,
+        .assertions = false,
+    });
+
     // Single-source the version from build.zig.zon: cli.zig imports it via
     // this options module, so --version and JSON reports can't drift from the
     // package version (v0.2.0 shipped binaries that still said 0.1.0).
@@ -25,7 +36,18 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_info", .module = build_info_mod },
             .{ .name = "zio", .module = zio.module("zio") },
+            .{ .name = "h2", .module = h2.module("h2") },
         },
+    });
+
+    // A standing check that the dependency options above actually applied.
+    const pin_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/h2_pin_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "h2", .module = h2.module("h2") }},
+        }),
     });
 
     // The CLI executable.
@@ -39,6 +61,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zrk", .module = mod },
                 .{ .name = "build_info", .module = build_info_mod },
                 .{ .name = "zio", .module = zio.module("zio") },
+                .{ .name = "h2", .module = h2.module("h2") },
             },
         }),
     });
@@ -85,4 +108,5 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&b.addRunArtifact(pin_tests).step);
 }

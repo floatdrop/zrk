@@ -36,6 +36,10 @@
             .url = "git+https://github.com/lalinsky/zio?ref=main#df666c286380bf513dfe843f65a8133207ad7373",
             .hash = "zio-0.17.0-xHbVVJPWJwBY3c_AkOFjUCF_pTIMnMc7ia9ujTjAfsbk",
         },
+        .h2 = .{
+            .url = "git+https://github.com/zoxy-io/h2#ce82b9a886435d8fdd53e1a8cfbe72ed918fb53e",
+            .hash = "h2-0.0.0--ngLtzZFBgCrbAucjP1hgw2-vJ2K12mf-04oR-EdzitD",
+        },
     },
     .paths = .{
         "build.zig",

@@ -17,6 +17,7 @@ pub const stats = @import("stats.zig");
 pub const report = @import("report.zig");
 pub const tui = @import("tui.zig");
 pub const tls = @import("tls.zig");
+pub const h2conn = @import("h2conn.zig");
 
 test {
     std.testing.refAllDecls(@This());
