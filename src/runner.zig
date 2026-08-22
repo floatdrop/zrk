@@ -75,6 +75,11 @@ pub fn run(
     interrupt: ?*const std.atomic.Value(bool),
 ) !Report {
     const request = try httpmod.buildRequest(arena, cfg);
+    // Built once for the whole run and shared by every connection, which is
+    // what `Encoder.Mode.static_only` guarantees is legal: the block depends on
+    // no encoder state, so replaying the same octets on every stream of every
+    // connection is byte-identical to encoding it each time.
+    const request_block = if (cfg.http2) try httpmod.buildRequestBlock(arena, cfg) else &[_]u8{};
     const address = try resolveAddress(io, cfg.url.host, cfg.url.port);
 
     // Load the system trust store once (shared, read-mostly) for HTTPS
@@ -121,6 +126,9 @@ pub fn run(
         .address = address,
         .host = cfg.url.host,
         .request = request,
+        .request_block = request_block,
+        .body = cfg.body,
+        .http2 = cfg.http2,
         .method = .of(cfg.method),
         .is_tls = cfg.url.isTls(),
         .insecure = cfg.insecure,

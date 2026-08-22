@@ -6,6 +6,7 @@
 //! bytes for throughput. It deliberately does not retain header or body content.
 
 const std = @import("std");
+const h2 = @import("h2");
 const Io = std.Io;
 const cli = @import("cli.zig");
 
@@ -53,6 +54,127 @@ pub fn buildRequest(allocator: std.mem.Allocator, cfg: *const cli.Config) ![]u8 
     try w.writeAll(cfg.body);
 
     return alloc_writer.toOwnedSlice();
+}
+
+/// The HTTP/2 request as one HPACK-encoded header block, built once.
+///
+/// Encoded with `Encoder.Mode.static_only`, which is an API guarantee in
+/// zoxy-io/h2 rather than an optimisation: the block depends on no encoder
+/// state, so it can be replayed byte-identically on every stream for the whole
+/// run. A block that touched the dynamic table would be legal only in the
+/// order it was produced, and zrk's request never changes.
+///
+/// The result is the caller's to free, like `buildRequest`'s.
+pub fn buildRequestBlock(allocator: std.mem.Allocator, cfg: *const cli.Config) ![]u8 {
+    // The field list and every string it points at live only until the block is
+    // encoded — HPACK copies the octets in. An arena rather than a `defer free`
+    // per allocation because there are a variable number of them (one lowered
+    // name per `-H`) and the first version of this leaked all of them.
+    var scratch: std.heap.ArenaAllocator = .init(allocator);
+    defer scratch.deinit();
+    const tmp = scratch.allocator();
+
+    var fields: std.ArrayList(h2.hpack.Field) = .empty;
+
+    // RFC 9113 §8.3: the pseudo-header fields, and they come first.
+    try fields.append(tmp, .{ .name = ":method", .value = cfg.method });
+    try fields.append(tmp, .{ .name = ":scheme", .value = if (cfg.url.isTls()) "https" else "http" });
+    try fields.append(tmp, .{ .name = ":path", .value = cfg.url.target });
+
+    // §8.3.1: `:authority` replaces `Host`, and carries the port only when it
+    // is not the scheme's default — the same rule `buildRequest` applies to
+    // `Host`, so the two transports address the same origin.
+    const default_port: u16 = if (cfg.url.isTls()) 443 else 80;
+    const authority = if (cfg.url.port == default_port)
+        try tmp.dupe(u8, cfg.url.host)
+    else
+        try std.fmt.allocPrint(tmp, "{s}:{d}", .{ cfg.url.host, cfg.url.port });
+    try fields.append(tmp, .{ .name = ":authority", .value = authority });
+
+    var has_ua = false;
+    var has_cl = false;
+    for (cfg.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) has_ua = true;
+        if (std.ascii.eqlIgnoreCase(h.name, "content-length")) has_cl = true;
+        // §8.2.1 requires field names to be lowercase on the wire. `-H` takes
+        // them in whatever case the user typed, exactly as HTTP/1.1 does, so
+        // the case is folded here rather than refused — the user asked for a
+        // header, not for a lesson.
+        try fields.append(tmp, .{
+            .name = try lowerName(tmp, h.name),
+            .value = h.value,
+        });
+    }
+    if (!has_ua) try fields.append(tmp, .{ .name = "user-agent", .value = "zrk" });
+
+    // No `Connection: keep-alive`: §8.2.2 makes connection-specific header
+    // fields malformed in HTTP/2, and `buildRequest` adds one.
+    if (!has_cl) {
+        if (cfg.body.len > 0) {
+            try fields.append(tmp, .{
+                .name = "content-length",
+                .value = try std.fmt.allocPrint(tmp, "{d}", .{cfg.body.len}),
+            });
+        } else if (methodAnticipatesBody(cfg.method)) {
+            try fields.append(tmp, .{ .name = "content-length", .value = "0" });
+        }
+    }
+
+    // Checked before it goes on the wire, once, for the block that will be sent
+    // for the whole run. A malformed request would be answered with a stream
+    // error on every single stream, and the run would report the target
+    // failing when it was us.
+    try validateRequestFields(fields.items);
+
+    return encodeBlock(allocator, fields.items);
+}
+
+/// Encode into a buffer sized from the fields themselves.
+fn encodeBlock(allocator: std.mem.Allocator, fields: []const h2.hpack.Field) ![]u8 {
+    // An upper bound rather than a guess: a literal costs its two lengths, the
+    // octets themselves, and a few of framing, and Huffman only ever shortens.
+    var bound: usize = 0;
+    for (fields) |field| bound += field.name.len + field.value.len + block_field_overhead;
+
+    const buffer = try allocator.alloc(u8, bound);
+    errdefer allocator.free(buffer);
+
+    var storage: h2.hpack.Encoder.Storage(0) = .{};
+    var encoder = storage.encoder(.static_only);
+    const encoded = encoder.encode(buffer, fields);
+    // `encode` reports how many fields fit rather than failing, so a short
+    // buffer is a partial block. The bound above makes that unreachable, and
+    // this is what says so.
+    if (encoded.fields != fields.len) return error.RequestTooLarge;
+
+    return allocator.realloc(buffer, encoded.written);
+}
+
+/// Framing octets one literal field can cost on top of its text: the two length
+/// prefixes and the representation byte, each of which is at most five octets
+/// for a length this side of 4 GiB.
+const block_field_overhead: usize = 16;
+
+fn lowerName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    const lowered = try allocator.alloc(u8, name.len);
+    for (lowered, name) |*out, in| out.* = std.ascii.toLower(in);
+    return lowered;
+}
+
+/// The request has to be a well-formed HTTP/2 request before it is sent a
+/// million times.
+fn validateRequestFields(fields: []const h2.hpack.Field) !void {
+    var validator: h2.fields.MessageValidator = .init(.{
+        .kind = .request,
+        // The stricter reading for what *we* send. zrk is lenient about what a
+        // target returns — a measurement should not become an argument — but a
+        // request it generates itself has no excuse for being questionable.
+        .rules = .strict,
+    });
+    for (fields) |field| {
+        validator.field(&field) catch return error.InvalidRequestHeader;
+    }
+    validator.finish() catch return error.InvalidRequestHeader;
 }
 
 /// Methods whose semantics anticipate request content (RFC 9110 §9.3), for
@@ -398,4 +520,93 @@ test "StatusClass.of boundaries" {
     try testing.expectEqual(StatusClass.redirect, StatusClass.of(301));
     try testing.expectEqual(StatusClass.client_error, StatusClass.of(499));
     try testing.expectEqual(StatusClass.server_error, StatusClass.of(503));
+}
+
+test "the h2 request block round-trips through a decoder" {
+    // The block is sent on every stream for a whole run, so what matters is
+    // that it decodes to the request the user asked for. Decoded with an empty
+    // dynamic table because `static_only` is what produced it — if the encoder
+    // ever touched the table, this would fail rather than silently produce a
+    // block only valid in the order it was made.
+    const allocator = std.testing.allocator;
+    var cfg: cli.Config = .{
+        .method = "POST",
+        .body = "hi",
+        .headers = &.{
+            .{ .name = "X-Trace-Id", .value = "abc123" },
+            .{ .name = "Accept", .value = "*/*" },
+        },
+    };
+    cfg.url = .{ .scheme = .http, .host = "example.com", .port = 8080, .target = "/submit?q=1" };
+
+    const block = try buildRequestBlock(allocator, &cfg);
+    defer allocator.free(block);
+
+    var storage: h2.hpack.DynamicTable.Storage(0) = .{};
+    var decoder: h2.hpack.Decoder = .init(storage.table(), 64 * 1024);
+    var buffer: [4096]u8 = undefined;
+    var iterator = decoder.iterate(&buffer, block);
+
+    var seen: [8][2][]const u8 = undefined;
+    var count: usize = 0;
+    while (try iterator.next()) |field| : (count += 1) {
+        seen[count] = .{ field.name, field.value };
+    }
+
+    try std.testing.expectEqualStrings(":method", seen[0][0]);
+    try std.testing.expectEqualStrings("POST", seen[0][1]);
+    try std.testing.expectEqualStrings(":scheme", seen[1][0]);
+    try std.testing.expectEqualStrings("http", seen[1][1]);
+    try std.testing.expectEqualStrings(":path", seen[2][0]);
+    try std.testing.expectEqualStrings("/submit?q=1", seen[2][1]);
+    // The port is not the scheme's default, so it belongs in the authority —
+    // the same rule `buildRequest` applies to `Host`.
+    try std.testing.expectEqualStrings(":authority", seen[3][0]);
+    try std.testing.expectEqualStrings("example.com:8080", seen[3][1]);
+    // `-H` names are folded to lowercase, which section 8.2.1 requires and
+    // HTTP/1.1 did not.
+    try std.testing.expectEqualStrings("x-trace-id", seen[4][0]);
+    try std.testing.expectEqualStrings("abc123", seen[4][1]);
+    try std.testing.expectEqualStrings("accept", seen[5][0]);
+    try std.testing.expectEqualStrings("user-agent", seen[6][0]);
+    try std.testing.expectEqualStrings("content-length", seen[7][0]);
+    try std.testing.expectEqualStrings("2", seen[7][1]);
+    try std.testing.expectEqual(@as(usize, 8), count);
+}
+
+test "the block never carries a connection-specific header" {
+    // `buildRequest` adds `Connection: keep-alive`, which RFC 9113 section
+    // 8.2.2 makes malformed in HTTP/2 — a server is required to reject the
+    // whole message for it. The h2 builder must not inherit that, and a user
+    // who passes one via -H must be refused rather than sent a request every
+    // stream of which will be reset.
+    const allocator = std.testing.allocator;
+    var cfg: cli.Config = .{ .headers = &.{.{ .name = "Connection", .value = "keep-alive" }} };
+    cfg.url = .{ .scheme = .http, .host = "example.com", .port = 80, .target = "/" };
+    try std.testing.expectError(error.InvalidRequestHeader, buildRequestBlock(allocator, &cfg));
+
+    // And nothing adds one on its own.
+    var plain: cli.Config = .{};
+    plain.url = .{ .scheme = .http, .host = "example.com", .port = 80, .target = "/" };
+    const block = try buildRequestBlock(allocator, &plain);
+    defer allocator.free(block);
+
+    var storage: h2.hpack.DynamicTable.Storage(0) = .{};
+    var decoder: h2.hpack.Decoder = .init(storage.table(), 64 * 1024);
+    var buffer: [4096]u8 = undefined;
+    var iterator = decoder.iterate(&buffer, block);
+    while (try iterator.next()) |field| {
+        try std.testing.expect(!std.mem.eql(u8, field.name, "connection"));
+    }
+}
+
+test "a header value that would split a request is refused" {
+    // The h2-to-h1 downgrade guard, applied to our own output. A CR in a value
+    // is the request-splitting primitive RFC 9113 section 8.2.1 exists for, and
+    // a load generator that emitted one would be attacking the target it was
+    // pointed at rather than measuring it.
+    const allocator = std.testing.allocator;
+    var cfg: cli.Config = .{ .headers = &.{.{ .name = "X-Evil", .value = "a\r\nx-injected: 1" }} };
+    cfg.url = .{ .scheme = .http, .host = "example.com", .port = 80, .target = "/" };
+    try std.testing.expectError(error.InvalidRequestHeader, buildRequestBlock(allocator, &cfg));
 }

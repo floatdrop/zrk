@@ -14,6 +14,7 @@ const net = std.Io.net;
 const hdr = @import("hdr.zig");
 const httpmod = @import("http.zig");
 const tlsmod = @import("tls.zig");
+const h2conn = @import("h2conn.zig");
 const pace = @import("pace.zig");
 const StatusClass = httpmod.StatusClass;
 
@@ -106,6 +107,24 @@ pub const Params = struct {
     address: net.IpAddress,
     host: []const u8,
     request: []const u8,
+    /// The same request as one HPACK-encoded header block, when `http2` is set.
+    ///
+    /// Built once at startup with `Encoder.Mode.static_only`, so it depends on
+    /// no encoder state and is replayed byte-identically on every stream — the
+    /// reason zrk pays no per-request HPACK cost for a request that never
+    /// changes.
+    request_block: []const u8 = &.{},
+    /// Request body, sent as DATA after the header block. Empty for the common
+    /// case, where the header block carries END_STREAM itself.
+    body: []const u8 = &.{},
+    /// Speak HTTP/2 with prior knowledge instead of HTTP/1.1.
+    ///
+    /// One request is in flight either way, so nothing else in this file
+    /// changes meaning: the pacing, the coordinated-omission correction, the
+    /// deadline shedding, and `watchTimer`'s abort-by-shutdown all work on the
+    /// same terms. That equivalence is exactly what stops holding the moment a
+    /// second stream is opened, which is why multiplexing is its own slice.
+    http2: bool = false,
     /// Framing classification of the request method (HEAD responses have no
     /// body); see `http.RequestMethod`.
     method: httpmod.RequestMethod = .other,
@@ -220,6 +239,40 @@ pub fn run(p: *Params) void {
             app_writer = &plain_writer.interface;
         }
 
+        // The HTTP/2 session, if this run speaks it: preface, our SETTINGS, the
+        // window we need, and the peer's SETTINGS acknowledged. A connection
+        // that cannot complete that never carried a request, so it counts as a
+        // connect error — the same as a TLS handshake that failed above.
+        var h2_session: h2conn.Session = .init(app_reader, app_writer);
+        if (p.http2) {
+            // Bounded by the wire timeout, for the same reason `connect` above
+            // is: a peer that accepts the connection and then never sends its
+            // SETTINGS leaves this read blocked forever, and the run would sit
+            // past `end` with nothing to show. `connect` already defends
+            // against the listen-backlog version of this; the handshake is the
+            // other half and was missing it.
+            //
+            // Found by mutation rather than by reading: breaking the HTTP/2
+            // path made the suite *hang* instead of fail, which is how the
+            // unbounded read surfaced.
+            var handshake_fired: std.atomic.Value(bool) = .init(false);
+            var handshake_group: Io.Group = .init;
+            if (p.timeout_ns != 0)
+                handshake_group.concurrent(io, watchTimer, .{ io, &stream, p.timeout_ns, &handshake_fired }) catch {};
+            const opened = h2_session.open();
+            handshake_group.cancel(io);
+
+            opened catch {
+                // A handshake cut off by the run's own end is a teardown
+                // artifact, like the connect above.
+                if (now(io).nanoseconds >= p.end.nanoseconds) return;
+                noteError(p, .connect);
+                stream.close(io);
+                io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
+                continue;
+            };
+        }
+
         var conn_open = true;
         defer stream.close(io);
 
@@ -276,7 +329,7 @@ pub fn run(p: *Params) void {
                 if (remaining_ns > 0)
                     timer_group.concurrent(io, watchTimer, .{ io, &stream, remaining_ns, &deadline_fired }) catch {};
             }
-            const work = performWork(p, app_reader, app_writer);
+            const work = performWork(p, app_reader, app_writer, if (p.http2) &h2_session else null);
             timer_group.cancel(io);
             const timed_out = wire_fired.load(.acquire) or deadline_fired.load(.acquire);
             const deadline_hit = deadline_fired.load(.acquire);
@@ -341,13 +394,38 @@ fn watchTimer(
 
 /// Send the fixed request and parse one response; touches only the
 /// transport, never the shared counters.
-fn performWork(p: *Params, app_reader: *Io.Reader, app_writer: *Io.Writer) WorkResult {
+fn performWork(
+    p: *Params,
+    app_reader: *Io.Reader,
+    app_writer: *Io.Writer,
+    session: ?*h2conn.Session,
+) WorkResult {
+    if (session) |active| return performWorkHttp2(p, active);
     app_writer.writeAll(p.request) catch return .write_failed;
     app_writer.flush() catch return .write_failed;
     // For TLS the app writer only encrypts into the socket writer's buffer; the
     // underlying stream writer must be flushed to actually send the ciphertext.
     if (p.is_tls) p.tls_state.?.swriter.interface.flush() catch return .write_failed;
     const resp = httpmod.parseResponse(app_reader, p.method) catch return .read_failed;
+    return .{ .ok = resp };
+}
+
+/// The HTTP/2 half of `performWork`.
+///
+/// Same shape and the same two failure kinds, because the caller's accounting
+/// is the same: a write that never left is a write error, and a response that
+/// never arrived is a read error. Which of h2's protocol failures is which
+/// matters only for the counter it lands in, and a `Protocol` error is a
+/// response we could not read.
+fn performWorkHttp2(p: *Params, session: *h2conn.Session) WorkResult {
+    const resp = session.exchange(p.request_block, p.body) catch |err| switch (err) {
+        error.Io => return .read_failed,
+        // GOAWAY, or a stream the peer reset: the connection is finished but
+        // the transport did not fail. Counted as a read error for the same
+        // reason an HTTP/1.1 server closing mid-response is.
+        error.Closed => return .read_failed,
+        error.Protocol, error.TooLarge => return .read_failed,
+    };
     return .{ .ok = resp };
 }
 
@@ -438,6 +516,8 @@ fn connect(io: Io, address: net.IpAddress, timeout_ns: u64) !net.Stream {
 
 const testing = std.testing;
 const zio = @import("zio");
+const h2 = @import("h2");
+const cli = @import("cli.zig");
 
 /// A tiny keep-alive HTTP server used to exercise the real client path. Accepts
 /// a single connection (the client holds one keep-alive connection for the whole
@@ -470,6 +550,169 @@ fn serveConn(io: Io, stream: *net.Stream) void {
         w.interface.writeAll(response) catch return;
         w.interface.flush() catch return;
     }
+}
+
+/// A minimal h2c server: read the preface and SETTINGS, then answer every
+/// request stream with a 200 and a two-octet body.
+///
+/// Built on the same `h2` codec the client uses, which is the point — this test
+/// is about whether `run` drives a real socket end to end under `--http2`, not
+/// about whether the codec agrees with itself. The unit tests in `h2conn.zig`
+/// cover the protocol; this covers the wiring.
+fn h2Serve(io: Io, server: *net.Server) void {
+    var stream = server.accept(io) catch return;
+    defer stream.close(io);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var wbuf: [16 * 1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var w = stream.writer(io, &wbuf);
+    const reader = &r.interface;
+    const writer = &w.interface;
+
+    // The client sends the preface first (RFC 9113 section 3.4).
+    const magic = reader.take(h2conn.preface.len) catch return;
+    if (!std.mem.eql(u8, magic, h2conn.preface)) return;
+
+    // Our SETTINGS, empty: the defaults are fine for a test server.
+    writeTestFrame(writer, .settings, 0, 0, &.{}) catch return;
+    writer.flush() catch return;
+
+    // One 200 response block, encoded once — the same trick the client uses.
+    var block: [64]u8 = undefined;
+    var storage: h2.hpack.Encoder.Storage(0) = .{};
+    var encoder = storage.encoder(.static_only);
+    const encoded = encoder.encode(&block, &.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/plain" },
+    });
+
+    while (true) {
+        const octets = reader.take(h2.frame.Header.octets) catch return;
+        const header = h2.frame.Header.parse(octets) catch return;
+        const payload = if (header.length > 0)
+            reader.take(header.length) catch return
+        else
+            &[_]u8{};
+        _ = payload;
+
+        switch (header.frame_type) {
+            .settings => if (!header.has(.ack)) {
+                writeTestFrame(writer, .settings, h2.frame.Flag.ack.bit(), 0, &.{}) catch return;
+                writer.flush() catch return;
+            },
+            .headers => {
+                // Answer on the stream the request opened.
+                writeTestFrame(
+                    writer,
+                    .headers,
+                    h2.frame.Flag.end_headers.bit(),
+                    header.stream_identifier,
+                    block[0..encoded.written],
+                ) catch return;
+                writeTestFrame(
+                    writer,
+                    .data,
+                    h2.frame.Flag.end_stream.bit(),
+                    header.stream_identifier,
+                    "hi",
+                ) catch return;
+                writer.flush() catch return;
+            },
+            // Window updates and everything else need no answer from a server
+            // that sends two octets per response.
+            else => {},
+        }
+    }
+}
+
+fn writeTestFrame(
+    writer: *Io.Writer,
+    frame_type: h2.frame.Type,
+    flags: u8,
+    stream: u31,
+    payload: []const u8,
+) !void {
+    const header: h2.frame.Header = .{
+        .length = @intCast(payload.len),
+        .frame_type = frame_type,
+        .flags = flags,
+        .stream_identifier = stream,
+    };
+    var octets: [h2.frame.Header.octets]u8 = undefined;
+    _ = try header.render(&octets);
+    try writer.writeAll(&octets);
+    if (payload.len > 0) try writer.writeAll(payload);
+}
+
+test "run drives HTTP/2 requests against a local h2c server" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    var group: Io.Group = .init;
+    group.async(io, h2Serve, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    // The request block, built the way the runner builds it.
+    var cfg: cli.Config = .{ .http2 = true };
+    cfg.url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = "/" };
+    const block = try httpmod.buildRequestBlock(testing.allocator, &cfg);
+    defer testing.allocator.free(block);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(200));
+
+    var params: Params = .{
+        .io = io,
+        .address = server_addr,
+        .host = "127.0.0.1",
+        .request = "",
+        .request_block = block,
+        .http2 = true,
+        .is_tls = false,
+        .insecure = false,
+        .schedule = .{ .constant = .{ .interval_ns = 2 * std.time.ns_per_ms } },
+        // A wire timeout, unlike the HTTP/1.1 tests above, and for a reason
+        // worth stating: those drive a server that always answers, so a broken
+        // client would fail on the assertions. A client that stops speaking
+        // HTTP/2 correctly gets no answer at all, and with no timeout the read
+        // blocks until the process is killed. Discovered by mutating
+        // `performWork` to ignore the session: the suite hung instead of
+        // failing. A gate that hangs is worse than one that fails.
+        .timeout_ns = 20 * std.time.ns_per_ms,
+        .end = end,
+        .stop = &stop,
+        .histogram = &histogram,
+        .counters = &counters,
+    };
+    run(&params);
+
+    group.await(io) catch {};
+    server.deinit(io);
+
+    try testing.expect(counters.completed > 0);
+    // Nothing timed out on the happy path, which is what makes the timeout
+    // above a safety net rather than part of the measurement.
+    try testing.expectEqual(@as(u64, 0), counters.timeouts);
+    try testing.expectEqual(@as(u64, 0), counters.read_errors);
+    try testing.expectEqual(@as(u64, 0), counters.status_errors);
+    try testing.expectEqual(@as(u64, 0), counters.write_errors);
+    try testing.expectEqual(@as(u64, 0), counters.connect_errors);
+    // Every completed request is a recorded latency sample, exactly as over
+    // HTTP/1.1 — which is the property this whole slice exists to preserve.
+    try testing.expectEqual(counters.completed, histogram.count());
+    // Two octets of body plus the response header block, per request.
+    try testing.expect(counters.bytes >= counters.completed * 2);
+    try testing.expectEqual(counters.completed, counters.status_class[2]);
 }
 
 test "run drives keep-alive requests against a local server" {
