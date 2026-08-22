@@ -32,3 +32,44 @@ jobs:
 
       - name: Test
         run: nix develop --command zig build test --summary all
+
+  # Every target the release ships, built the way the release builds them.
+  #
+  # `build-test` above compiles for the host only. That was harmless while zrk
+  # was pure Zig and cross-compiled to anything for free; it stopped being
+  # harmless the moment TLS brought in libcrypto, because a C dependency is
+  # exactly what breaks a cross-compile and nothing here would notice until a
+  # tag was pushed.
+  #
+  # zoxy learned this the expensive way — its release workflow records that
+  # gaining a C dependency "took the release from four platforms to one", found
+  # on the 0.2.0 tag. This job is that lesson, paid for in CI minutes instead of
+  # a broken release.
+  cross:
+    name: cross ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Every target reports. "At least one broke" is not the useful answer;
+      # "which ones" is.
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - x86_64-macos
+          - aarch64-macos
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # ReleaseFast, matching release.yml: a debug cross-compile would not
+      # exercise the same code generation, and it is the release this is
+      # standing in for.
+      - name: Cross-compile
+        run: |
+          nix develop --command zig build \
+            -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
