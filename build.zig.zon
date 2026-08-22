@@ -65,8 +65,8 @@
         // ztls is Linux and macOS only by design; the Windows release targets
         // were dropped for it in 5a36623.
         .ztls = .{
-            .url = "git+https://github.com/zoxy-io/ztls?ref=zoxy-tls#c4d0f552c7d16fb2c7bc587c71ba5376a8a37562",
-            .hash = "ztls-0.0.0-SHHDXkr0FgBp4kN6V23SQy0cdPOC5St9cBNoJIIyzzn_",
+            .url = "git+https://github.com/zoxy-io/ztls?ref=zoxy-tls#03c246477370d83bfc38d5168250e10fb235f358",
+            .hash = "ztls-0.0.0-SHHDXrvzFgAxDlPTWEEam3B2YclV_S0hHpOrD3qGFnEp",
         },
     },
     .paths = .{
