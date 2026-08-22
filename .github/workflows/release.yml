@@ -47,6 +47,10 @@ jobs:
           echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
           # On `push` there are no inputs at all, so this is empty and the
           # release is real. Only an explicit dispatch can ask for a dry run.
+          # The publish steps gate on `dry == 'false'` rather than
+          # `!= 'true'`, so this output going missing blocks a release instead
+          # of publishing one that was asked to be a rehearsal. A release that
+          # did not happen can be re-run; one that did cannot be unpublished.
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             echo "dry=true" >> "$GITHUB_OUTPUT"
             echo "::notice::dry run — building $ref, publishing nothing"
@@ -157,7 +161,7 @@ jobs:
           fi
 
       - name: Publish GitHub Release
-        if: needs.version.outputs.dry != 'true'
+        if: needs.version.outputs.dry == 'false'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.version.outputs.tag }}
@@ -166,7 +170,7 @@ jobs:
           generate_release_notes: ${{ steps.notes.outputs.generate }}
 
       - name: Update Homebrew formula
-        if: needs.version.outputs.dry != 'true'
+        if: needs.version.outputs.dry == 'false'
         env:
           HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         run: |
