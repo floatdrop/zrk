@@ -3,6 +3,13 @@ name: Release
 # Cut a release by pushing a version tag:
 #   git tag v0.1.0 && git push origin v0.1.0
 # or run manually from the Actions tab, supplying the tag.
+#
+# `release.yml` only ever runs on a tag, so a change to it is unverifiable
+# except by cutting a release — and a broken release tag is public and
+# half-published. Hence `dry_run`: dispatch with an existing tag and it builds,
+# packages, gathers and checksums exactly as a real release does, then stops
+# before publishing anything or touching the tap. Use it after editing this
+# file.
 on:
   push:
     tags: ['v*']
@@ -11,16 +18,73 @@ on:
       tag:
         description: 'Release tag (e.g. v0.1.0)'
         required: true
+      dry_run:
+        description: 'Build and package only — publish nothing, touch no tap'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 jobs:
-  release:
-    name: build binaries & publish release
+  # One job so the derivation lives in one place. Matrix jobs can declare
+  # outputs, but which matrix leg's value survives is unspecified when they
+  # differ — not a race worth inviting for two `${ref#v}` expansions.
+  version:
+    name: resolve version
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+      dry: ${{ steps.ver.outputs.dry }}
     steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$ref" >> "$GITHUB_OUTPUT"
+          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+          # On `push` there are no inputs at all, so this is empty and the
+          # release is real. Only an explicit dispatch can ask for a dry run.
+          # The publish steps gate on `dry == 'false'` rather than
+          # `!= 'true'`, so this output going missing blocks a release instead
+          # of publishing one that was asked to be a rehearsal. A release that
+          # did not happen can be re-run; one that did cannot be unpublished.
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "dry=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::dry run — building $ref, publishing nothing"
+          else
+            echo "dry=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Zig cross-compiles any target from any host, so these could all run on one
+  # runner — and did, serially, for 15 minutes. Each leg builds BoringSSL from
+  # source, which is most of that; four runners turn a sum into a maximum.
+  build:
+    name: build ${{ matrix.label }}
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      # Which target broke is the useful answer, not that one did.
+      fail-fast: false
+      matrix:
+        include:
+          # Linux and macOS only. The Windows targets were dropped in favour of
+          # adopting ztls for TLS, which is Linux and macOS by design — its
+          # `src/entropy.zig` is an outright `@compileError` anywhere else, and
+          # its README scopes it to "TLS 1.3 only, on Linux and macOS … no
+          # Windows portability layer". See zoxy-io/zrk#21.
+          - { zig: x86_64-linux-musl,  label: x86_64-linux }
+          - { zig: aarch64-linux-musl, label: aarch64-linux }
+          - { zig: x86_64-macos,       label: x86_64-macos }
+          - { zig: aarch64-macos,      label: aarch64-macos }
+    steps:
+      # A dispatch defaults to the branch it was launched from, which would
+      # build one commit and label it with another's version. Build the tag.
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       # Zig cross-compiles every target from this one Linux runner, using the
       # exact Zig 0.16 the flake pins.
@@ -29,44 +93,51 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Resolve version
-        id: ver
-        run: |
-          ref="${{ github.event.inputs.tag || github.ref_name }}"
-          echo "tag=$ref" >> "$GITHUB_OUTPUT"
-          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Build and package all targets
+      - name: Build and package
         run: |
           set -euo pipefail
-          version="${{ steps.ver.outputs.version }}"
+          version="${{ needs.version.outputs.version }}"
           mkdir -p dist
-
-          # zig-target : release-archive-label
-          #
-          # Linux and macOS only. The Windows targets were dropped in favour of
-          # adopting ztls for TLS, which is Linux and macOS by design — its
-          # `src/entropy.zig` is an outright `@compileError` anywhere else, and
-          # its README scopes it to "TLS 1.3 only, on Linux and macOS … no
-          # Windows portability layer". See zoxy-io/zrk#21.
-          targets="
-            x86_64-linux-musl:x86_64-linux
-            aarch64-linux-musl:aarch64-linux
-            x86_64-macos:x86_64-macos
-            aarch64-macos:aarch64-macos
-          "
-          for pair in $targets; do
-            zig_t="${pair%%:*}"
-            label="${pair##*:}"
-            echo "::group::$label ($zig_t)"
-            nix develop --command zig build \
-              -Dtarget="$zig_t" -Doptimize=ReleaseFast --prefix "out/$label"
-            tar czf "dist/zrk-$version-$label.tar.gz" -C "out/$label/bin" zrk
-            echo "::endgroup::"
-          done
-
-          ( cd dist && sha256sum * > SHA256SUMS.txt )
+          nix develop --command zig build \
+            -Dtarget="${{ matrix.zig }}" -Doptimize=ReleaseFast --prefix out
+          # Tar here, before the artifact layer sees it: `upload-artifact` zips
+          # its payload and drops the executable bit. Inside a tarball the mode
+          # is data, so it survives the round trip by construction.
+          tar czf "dist/zrk-$version-${{ matrix.label }}.tar.gz" -C out/bin zrk
           ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zrk-${{ matrix.label }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: zrk-*
+          merge-multiple: true
+          path: dist
+
+      # SHA256SUMS.txt covers all four archives, so it can only be written once
+      # they are all here — a matrix leg computing its own would be four files
+      # racing for one name.
+      - name: Checksum
+        run: |
+          set -euo pipefail
+          ( cd dist && sha256sum *.tar.gz > SHA256SUMS.txt )
+          cat dist/SHA256SUMS.txt
+          count=$(ls dist/*.tar.gz | wc -l)
+          [ "$count" -eq 4 ] || { echo "expected 4 archives, found $count"; exit 1; }
 
       # Curated notes when `docs/releases/<tag>.md` exists, generated otherwise.
       #
@@ -78,7 +149,7 @@ jobs:
         id: notes
         run: |
           set -euo pipefail
-          path="docs/releases/${{ steps.ver.outputs.tag }}.md"
+          path="docs/releases/${{ needs.version.outputs.tag }}.md"
           if [ -f "$path" ]; then
             echo "path=$path" >> "$GITHUB_OUTPUT"
             echo "generate=false" >> "$GITHUB_OUTPUT"
@@ -90,20 +161,22 @@ jobs:
           fi
 
       - name: Publish GitHub Release
+        if: needs.version.outputs.dry == 'false'
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.ver.outputs.tag }}
+          tag_name: ${{ needs.version.outputs.tag }}
           files: dist/*
           body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: ${{ steps.notes.outputs.generate }}
 
       - name: Update Homebrew formula
+        if: needs.version.outputs.dry == 'false'
         env:
           HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         run: |
           set -euo pipefail
-          version="${{ steps.ver.outputs.version }}"
-          tag="${{ steps.ver.outputs.tag }}"
+          version="${{ needs.version.outputs.version }}"
+          tag="${{ needs.version.outputs.tag }}"
 
           sha_aarch64_macos=$(grep "zrk-$version-aarch64-macos.tar.gz" dist/SHA256SUMS.txt | awk '{print $1}')
           sha_x86_64_macos=$(grep  "zrk-$version-x86_64-macos.tar.gz"  dist/SHA256SUMS.txt | awk '{print $1}')
@@ -166,3 +239,37 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "zrk: update to $version"
           git push
+
+      # A guard that fails closed can fail *silently*: if `dry` were ever
+      # anything but the 'false' those steps test for, a real release would
+      # skip both of them and still report success — a green run that shipped
+      # nothing. So check the outcome rather than trusting the condition.
+      #
+      # This one is deliberately `!= 'true'`: erring towards running a check is
+      # the safe direction, the opposite of erring towards publishing.
+      - name: Verify the release was published
+        if: needs.version.outputs.dry != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.version.outputs.tag }}"
+          gh release view "$tag" --json assets --jq '.assets[].name' | tee assets.txt
+          count=$(grep -c '\.tar\.gz$' assets.txt)
+          [ "$count" -eq 4 ] || { echo "expected 4 archives on $tag, found $count"; exit 1; }
+          grep -qx 'SHA256SUMS.txt' assets.txt || { echo "no SHA256SUMS.txt on $tag"; exit 1; }
+          echo "$tag published with 4 archives and checksums"
+
+      - name: Dry run summary
+        if: needs.version.outputs.dry == 'true'
+        run: |
+          {
+            echo "### Dry run — nothing was published"
+            echo
+            echo "Built \`${{ needs.version.outputs.tag }}\`, packaged four archives,"
+            echo "and stopped before the release and the tap."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
