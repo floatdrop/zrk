@@ -31,47 +31,52 @@ pub fn build(b: *std.Build) void {
 
     // TLS, and the libcrypto under it.
     //
-    // The three lines below are what the `ztls-probe` branch cost six CI runs
-    // to establish, and none of them is obvious. On a native build pkg-config
-    // supplies all three invisibly through `linkSystemLibrary("crypto")`; a
+    // On a native build pkg-config supplies the search path, the include path
+    // and the archive invisibly through `linkSystemLibrary("crypto")`. A
     // cross-build has no pkg-config, so each becomes explicit:
     //
-    //   1. a library search path, so ztls's `linkSystemLibrary` finds the
-    //      archive at all;
+    //   1. a library search path, so ztls's `linkSystemLibrary("crypto")`
+    //      finds an archive by that name at all — see the alias below;
     //   2. an include path on **ztls's own module**, because include paths are
-    //      per-module and the `@cImport` of `openssl/base.h` lives there, not
-    //      here;
-    //   3. `bcm` as well as `crypto` — modern BoringSSL splits the primitives
-    //      into a second archive that declares no dependency on the first, and
-    //      omitting it leaves 236 undefined `BN_*` symbols.
-    const boringssl = b.dependency("boringssl", .{
+    //      per-module and the `@cImport` of `openssl/crypto.h` lives there,
+    //      not here. `linkLibrary` carries the package's installed headers, so
+    //      linking the artifact into that module covers both.
+    const openssl = b.dependency("openssl", .{
         .target = target,
         .optimize = optimize,
     });
+    const libcrypto = openssl.artifact("openssl");
+
+    // ztls asks the linker for `-lcrypto` by name, and this package emits
+    // `libopenssl.a`. Linking the artifact resolves every symbol, but the
+    // linker still has to *find* a file called `libcrypto.a` or it fails
+    // before it gets that far — so publish one under that name and point the
+    // search path at it. A copy, not a rename of the artifact, because the
+    // artifact's name is the package's API and other consumers use it.
+    const crypto_alias = b.addWriteFiles();
+    _ = crypto_alias.addCopyFile(libcrypto.getEmittedBin(), "libcrypto.a");
+    const crypto_alias_dir = crypto_alias.getDirectory();
+
     const ztls_dep = b.dependency("ztls", .{
         .target = target,
         .optimize = optimize,
-        .@"crypto-backend" = @as([]const u8, "boringssl"),
         // We supply libcrypto, so pkg-config must not. Left on, it injects the
-        // system OpenSSL's include path ahead of BoringSSL's, `openssl/base.h`
-        // resolves to one and its neighbours to the other, and the C import
-        // dies on typedef collisions — but only on machines where pkg-config
-        // knows about OpenSSL, so it passes CI and breaks on a laptop.
+        // system OpenSSL's include path ahead of ours, and the C import dies
+        // on typedef collisions — but only on machines where pkg-config knows
+        // about OpenSSL, so it passes CI and breaks on a laptop.
         .@"crypto-pkg-config" = false,
     });
     const ztls_core = ztls_dep.module("ztls");
-    ztls_core.addIncludePath(boringssl.namedLazyPath("ssl_include"));
+    ztls_core.linkLibrary(libcrypto);
     const ztls_std = ztls_dep.module("ztls_std");
 
-    // Every artifact that reaches `src/tls.zig` needs both archives and the
+    // Every artifact that reaches `src/tls.zig` needs the archive and the
     // search path; they always travel together, so they are set in one place
     // rather than repeated per artifact.
     const linkCrypto = struct {
-        fn apply(module: *std.Build.Module, bssl: *std.Build.Dependency) void {
-            const crypto = bssl.artifact("crypto");
-            module.addLibraryPath(crypto.getEmittedBinDirectory());
-            module.linkLibrary(crypto);
-            module.linkLibrary(bssl.artifact("bcm"));
+        fn apply(module: *std.Build.Module, lib: *std.Build.Step.Compile, alias_dir: std.Build.LazyPath) void {
+            module.addLibraryPath(alias_dir);
+            module.linkLibrary(lib);
             module.link_libc = true;
         }
     }.apply;
@@ -87,7 +92,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ztls_std", .module = ztls_std },
         },
     });
-    linkCrypto(mod, boringssl);
+    linkCrypto(mod, libcrypto, crypto_alias_dir);
     // `cli.zig` checks the README's usage block against the real help text.
     // `@embedFile` cannot escape the module root, so the file arrives as a named
     // import instead.
@@ -125,7 +130,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    linkCrypto(exe.root_module, boringssl);
+    linkCrypto(exe.root_module, libcrypto, crypto_alias_dir);
     exe.root_module.addAnonymousImport("readme", .{ .root_source_file = b.path("README.md") });
     b.installArtifact(exe);
 

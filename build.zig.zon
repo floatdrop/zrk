@@ -46,12 +46,23 @@
         // normally satisfy — but pkg-config only works when the host is the
         // target, which is why zoxy builds natively on one runner per target
         // and lost cross-compilation when it gained this dependency. A Zig-built
-        // BoringSSL linked as an artifact keeps zrk's single-runner
-        // cross-compile: proven for all four remaining targets on the
-        // `ztls-probe` branch, aarch64 included.
-        .boringssl = .{
-            .url = "git+https://github.com/allyourcodebase/boringssl#ec7cca75cbf5381ba4a9e111d1f12236f8f2bd6a",
-            .hash = "boringssl-0.20260526.0-EhtkNaI5AAAUWRtpFwiFhqdvxjAMMWkcx-iHkKIppGBV",
+        // libcrypto linked as an artifact keeps zrk's single-runner
+        // cross-compile.
+        //
+        // OpenSSL rather than BoringSSL, and the same pin zoxy uses, so the two
+        // programs terminate and originate TLS on the same primitives. The
+        // BoringSSL family has no `CRYPTO_set_mem_functions`, which zoxy's fixed
+        // libcrypto heap cannot start without — so a shared pin had to be this
+        // one. zrk itself does not install allocation hooks; it changes here to
+        // stop the two from drifting.
+        //
+        // The fork carries allyourcodebase/openssl#5 (pre-generated perlasm for
+        // aarch64, which upstream has only for x86_64) on top of a 3.5.7 bump:
+        // the LTS line, supported to 2030. Verified building for all four
+        // release targets.
+        .openssl = .{
+            .url = "git+https://github.com/zoxy-io/openssl?ref=openssl-3.5.7#546ec9845fa43013021609a8590e03678cc0fb20",
+            .hash = "openssl-3.5.7-TC9C3eDHfwHNGqKQk63LrMZg6g-YSvctDN8wNP1uktMX",
         },
         // TLS 1.3, for ALPN and therefore for HTTP/2 over TLS (#21).
         //
