@@ -46,6 +46,26 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const libcrypto = openssl.artifact("openssl");
+    // Zig's C sanitizers off for the vendored C, in every mode. `sanitize_c`
+    // defaults to `.full` in Debug and `.trap` in ReleaseSafe, and only the
+    // `.full` arm passes `-fno-sanitize=function` (Zig's src/Compilation.zig),
+    // whose comment there calls the pattern it flags "very common, and
+    // well-defined"; `lib/zig/ubsan_rt.zig` leaves the matching handler
+    // commented out for the same reason. So the one check Zig deliberately
+    // disables is armed only in ReleaseSafe, as a `ud1` trap, and
+    // `OPENSSL_sk_pop_free` calling its `free_func` through a cast pointer is
+    // the first one a TLS run reaches — 12039 traps in the binary, 2401 of
+    // them that check, and `-Doptimize=ReleaseSafe` dies in
+    // `privateKeyFromSecret` generating the client's ephemeral key before a
+    // single request goes out.
+    //
+    // Preventive rather than a bug fix: every build this project ships is
+    // ReleaseFast (ci.yml, release.yml), where `sanitize_c` is already `.off`,
+    // and nothing in CI builds ReleaseSafe to notice otherwise. Not
+    // theoretical, though — this line missing is what shipped zoxy v0.6.0 with
+    // TLS that could not start (zoxy-io/zoxy#283). Set explicitly so the
+    // answer is a decision here rather than a consequence of an optimize flag.
+    libcrypto.root_module.sanitize_c = .off;
 
     // ztls asks the linker for `-lcrypto` by name, and this package emits
     // `libopenssl.a`. Linking the artifact resolves every symbol, but the
