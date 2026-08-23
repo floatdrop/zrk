@@ -27,6 +27,12 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
+      # Before Build, because it is the cheapest gate here and a formatting
+      # failure should not cost a compile to discover. Nothing enforced this
+      # until now, and two files had drifted unnoticed.
+      - name: Check formatting
+        run: nix develop --command zig fmt --check build.zig build.zig.zon src
+
       - name: Build
         run: nix develop --command zig build
 
