@@ -210,10 +210,10 @@ pub const Dashboard = struct {
             self.prev_lines = try self.drawPanel(w, snap, rate, bps, elapsed_s, total_s, false);
         } else {
             try w.print("[{d:6.1}s] {d:8.0} req/s {f}/s  p50={f} p99={f} p99.9={f} max={f}  errs={d}\n", .{
-                elapsed_s,                             rate,
-                Bytes.of(bps),                         Dur.of(snap.hist.valueAtPercentile(50)),
+                elapsed_s,                               rate,
+                Bytes.of(bps),                           Dur.of(snap.hist.valueAtPercentile(50)),
                 Dur.of(snap.hist.valueAtPercentile(99)), Dur.of(snap.hist.valueAtPercentile(99.9)),
-                Dur.of(snap.hist.max()),               snap.counters.socketErrors() + snap.counters.status_errors + snap.counters.deadline_errors,
+                Dur.of(snap.hist.max()),                 snap.counters.socketErrors() + snap.counters.status_errors + snap.counters.deadline_errors,
             });
         }
         try self.fw.interface.flush();

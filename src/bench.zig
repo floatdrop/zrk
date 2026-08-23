@@ -77,7 +77,6 @@ pub fn main() !void {
     }
     const span = if (hi >= lo) hi - lo + 1 else 0;
 
-    
     print("histogram: counts_len={d}  ({d:.1} KiB)\n", .{ counts_len, @as(f64, @floatFromInt(bytes)) / 1024.0 });
     print("recorded:  n=200000  min={d}us max={d}us\n", .{ src.min_value, src.max_value });
     print("touched:   [{d}..{d}]  span={d}  ({d:.1}% of array)\n\n", .{
