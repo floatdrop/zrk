@@ -298,9 +298,17 @@ pub fn run(p: *Params) void {
 
             // Anchor the schedule on the first request; each send's intended
             // time is a closed-form function of its index (constant or ramp).
+            // In `.closed` mode there is no independent schedule to solve —
+            // the next send is intended for right now — which degenerately
+            // zeroes out the pacing wait below, the deadline check (never
+            // behind its own "now"), and the CO correction (latency becomes
+            // actual round-trip time), without needing to special-case any of
+            // that downstream logic.
             if (anchor == null) anchor = t;
-            const offset = p.schedule.offsetNs(send_index, p.phase);
-            const scheduled = anchor.?.addDuration(Io.Duration.fromNanoseconds(@intCast(offset)));
+            const scheduled = if (p.schedule == .closed) t else blk: {
+                const offset = p.schedule.offsetNs(send_index, p.phase);
+                break :blk anchor.?.addDuration(Io.Duration.fromNanoseconds(@intCast(offset)));
+            };
 
             // Schedule lag: how late this send already is. Positive only under
             // load (when ahead we pace below); feeds the backlog gauge and the
@@ -788,6 +796,63 @@ test "run drives keep-alive requests against a local server" {
     try testing.expectEqual(counters.completed, histogram.count());
     // Every response is fully consumed and counted (headers + body).
     try testing.expectEqual(counters.completed * response_len, counters.bytes);
+}
+
+test "closed schedule sends as fast as the server answers, never behind" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    var group: Io.Group = .init;
+    group.async(io, testServe, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(200));
+
+    var params: Params = .{
+        .io = io,
+        .address = server_addr,
+        .host = "127.0.0.1",
+        .request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        .is_tls = false,
+        .insecure = false,
+        .schedule = .closed,
+        .timeout_ns = 0,
+        .end = end,
+        .stop = &stop,
+        .histogram = &histogram,
+        .counters = &counters,
+    };
+    run(&params);
+
+    group.await(io) catch {};
+    server.deinit(io);
+
+    try testing.expect(counters.completed > 0);
+    // testServe answers instantly over loopback, so an unthrottled connection
+    // clears far more than the ~40 requests a 2ms-interval (~500 req/s)
+    // schedule would allow in this same 200ms window (the sibling keep-alive
+    // test above uses exactly that schedule) -- this is the property .closed
+    // exists for: finding the real ceiling instead of being capped by one.
+    try testing.expect(counters.completed > 40);
+    // No independent schedule to fall behind: the backlog gauge stays at its
+    // zero value, and no request is ever shed or aborted on that basis.
+    try testing.expectEqual(@as(u64, 0), counters.max_behind_ns);
+    try testing.expectEqual(@as(u64, 0), counters.deadline_errors);
+    try testing.expectEqual(@as(u64, 0), counters.status_errors);
+    // Every completed response is a recorded (round-trip, not CO-adjusted-
+    // backward) latency sample, same invariant as the paced schedules above.
+    try testing.expectEqual(counters.completed, histogram.count());
 }
 
 /// Serves HEAD-style responses: headers advertising a Content-Length that has

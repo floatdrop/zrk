@@ -374,6 +374,8 @@ fn printUsageError(io: Io, err: cli.ParseError) !void {
         error.ZeroRate => "zrk: rate (-R) must be greater than 0\n\n",
         error.ZeroInterval => "zrk: --interval must be greater than 0\n\n",
         error.ZeroRefresh => "zrk: --refresh must be greater than 0\n\n",
+        error.ClosedWithRamp => "zrk: --closed is incompatible with a ramp (-R A:B)\n\n",
+        error.ClosedWithDeadline => "zrk: --closed is incompatible with --deadline\n\n",
         error.OutOfMemory => "zrk: out of memory\n\n",
     };
     try writeAll(io, .stderr(), msg);
