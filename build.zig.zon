@@ -40,6 +40,21 @@
             .url = "git+https://github.com/zoxy-io/h2#ce82b9a886435d8fdd53e1a8cfbe72ed918fb53e",
             .hash = "h2-0.0.0--ngLtzZFBgCrbAucjP1hgw2-vJ2K12mf-04oR-EdzitD",
         },
+        // The HTTP/1.1 response parser, shared with the zoxy benchmark harness
+        // rather than hand-rolled a third time. zurl owns framing — chunked,
+        // bodyless statuses, TE-beats-CL, conflicting Content-Length — and zrk
+        // owns the request, which it builds once and replays: `writeRequest`
+        // re-serializes per call, which measured 93-103 ns against 2.6 ns for
+        // sending the prebuilt blob, so only the PARSER half is adopted here.
+        //
+        // It clears rule 6 the same way hparse cleared it for zurl: std-only
+        // through `*Io.Reader`/`*Io.Writer`, with no runtime and no TLS stack
+        // of its own, so it cannot put a second zio or a second libcrypto in
+        // this graph. Its one transitive pin, hparse, is std-only too.
+        .zurl = .{
+            .url = "git+https://github.com/zoxy-io/zurl#4ecb1768985425d4f09b317f23f203983ef87d96",
+            .hash = "zurl-0.0.0--VALCi1dBQA6i4gkVVX11IV13I784dueJYYAzyZZTBPz",
+        },
         // libcrypto for ztls, built by Zig rather than found on the system.
         //
         // ztls declares `linkSystemLibrary("crypto")`, which pkg-config would

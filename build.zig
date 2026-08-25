@@ -59,6 +59,12 @@ pub fn build(b: *std.Build) void {
         .assertions = false,
     });
 
+    // The HTTP/1.1 response parser (see build.zig.zon for why only the parser).
+    const zurl = b.dependency("zurl", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Single-source the version from build.zig.zon: cli.zig imports it via
     // this options module, so --version and JSON reports can't drift from the
     // package version (v0.2.0 shipped binaries that still said 0.1.0).
@@ -149,6 +155,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_info", .module = build_info_mod },
             .{ .name = "zio", .module = zio.module("zio") },
             .{ .name = "h2", .module = h2.module("h2") },
+            .{ .name = "zurl", .module = zurl.module("zurl") },
             .{ .name = "ztls_std", .module = ztls_std },
         },
     });
@@ -186,6 +193,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_info", .module = build_info_mod },
                 .{ .name = "zio", .module = zio.module("zio") },
                 .{ .name = "h2", .module = h2.module("h2") },
+                .{ .name = "zurl", .module = zurl.module("zurl") },
                 .{ .name = "ztls_std", .module = ztls_std },
             },
         }),
