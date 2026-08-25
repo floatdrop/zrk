@@ -291,6 +291,16 @@ pub fn run(p: *Params) void {
         var conn_open = true;
         defer stream.close(io);
 
+        // One watcher for every request this connection will serve. Registered
+        // after `stream.close` so LIFO runs the cancel first — the watcher is
+        // joined before the stream it may shut down goes away.
+        const wd_active = p.timeout_ns != 0 or (p.deadline_abort and p.deadline_ns != 0);
+        var wd: Watchdog = .{};
+        var wd_group: Io.Group = .init;
+        defer wd_group.cancel(io);
+        if (wd_active)
+            wd_group.concurrent(io, watchConnection, .{ io, &stream, &wd, p.timeout_ns }) catch {};
+
         // Serve requests on this connection until it must close or the test ends.
         while (conn_open and !p.stop.load(.monotonic)) {
             const t = now(io);
@@ -328,34 +338,40 @@ pub fn run(p: *Params) void {
             }
 
             // Pace: if we're ahead of schedule, wait; if behind, fire immediately.
+            // The wire timeout runs from the *actual* send, so a send that
+            // paced has to re-read the clock; one that fired immediately
+            // (every send in `.closed`) reuses `t` and pays nothing.
+            var send_ts = t;
             if (scheduled.nanoseconds > t.nanoseconds) {
                 const wait = Io.Duration.fromNanoseconds(scheduled.nanoseconds - t.nanoseconds);
                 io.sleep(wait, .awake) catch return;
+                send_ts = now(io);
             }
             send_index += 1;
 
-            // Per-request timer tasks: one for the wire timeout, one for the
-            // CO deadline abort. Each sleeps to its bound and, if the response
-            // doesn't arrive first, shuts the stream down to unblock the read.
-            // `timer_group.cancel` after performWork cancels un-fired timers and
-            // joins fired ones so the flags and stream are safe to use after.
-            var wire_fired: std.atomic.Value(bool) = .init(false);
-            var deadline_fired: std.atomic.Value(bool) = .init(false);
-            var timer_group: Io.Group = .init;
-            defer timer_group.cancel(io);
-            if (p.timeout_ns != 0)
-                timer_group.concurrent(io, watchTimer, .{ io, &stream, p.timeout_ns, &wire_fired }) catch {};
-            if (p.deadline_abort and p.deadline_ns != 0) {
-                // behind_ns <= deadline_ns here (shed check above), so it fits u64.
-                const behind: u64 = if (behind_ns > 0) @intCast(behind_ns) else 0;
-                const remaining_ns = p.deadline_ns - behind;
-                if (remaining_ns > 0)
-                    timer_group.concurrent(io, watchTimer, .{ io, &stream, remaining_ns, &deadline_fired }) catch {};
-            }
+            // Publish this request's bound to the connection's watcher. Both
+            // bounds are absolute timestamps — the wire timeout from the actual
+            // send, the CO abort from `scheduled` — so the earlier one binds and
+            // the two collapse into a single deadline instead of two timers.
+            const wire_deadline_ns: u64 = if (p.timeout_ns != 0)
+                @intCast(send_ts.nanoseconds + @as(i128, p.timeout_ns))
+            else
+                0;
+            const co_deadline_ns: u64 = if (p.deadline_abort and p.deadline_ns != 0)
+                @intCast(scheduled.nanoseconds + @as(i128, p.deadline_ns))
+            else
+                0;
+            const co_binds = co_deadline_ns != 0 and
+                (wire_deadline_ns == 0 or co_deadline_ns <= wire_deadline_ns);
+            if (wd_active) wd.arm(
+                if (co_binds) co_deadline_ns else wire_deadline_ns,
+                co_binds,
+            );
+
             const work = performWork(p, app_reader, app_writer, if (p.http2) &h2_session else null);
-            timer_group.cancel(io);
-            const timed_out = wire_fired.load(.acquire) or deadline_fired.load(.acquire);
-            const deadline_hit = deadline_fired.load(.acquire);
+            if (wd_active) wd.disarm();
+            const timed_out = wd.fired.load(.acquire);
+            const deadline_hit = timed_out and wd.fired_co.load(.acquire);
 
             switch (work) {
                 .write_failed => {
@@ -400,10 +416,106 @@ const WorkResult = union(enum) {
     read_failed,
 };
 
+/// One connection's wire-timeout/CO-abort state, enforced by a single
+/// long-lived `watchConnection` task instead of a task spawned per request.
+///
+/// Requests are strictly sequential on a connection — at most one is ever on
+/// the wire — so one watcher can enforce every request's bound. The request
+/// loop only publishes the in-flight deadline here (`arm`) and withdraws it
+/// (`disarm`); both are a couple of atomic stores, against a task spawn plus
+/// cancel-and-join per request for the old `watchTimer`.
+const Watchdog = struct {
+    /// Absolute monotonic-ns deadline of the request on the wire (0 = idle).
+    deadline_ns: std.atomic.Value(u64) = .init(0),
+    /// Whether `deadline_ns` came from the CO abort bound rather than the wire
+    /// timeout, so a fire lands in the right error class.
+    co_bound: std.atomic.Value(bool) = .init(false),
+    /// Seqlock counter, bumped on every `arm` and every `disarm`. A watcher
+    /// that finds it unchanged across its wait knows no request started or
+    /// finished meanwhile, so the one it timed is still on the wire. That is
+    /// what makes firing safe without a fresh task per request — and it does
+    /// not depend on consecutive deadlines being distinct, which two sends in
+    /// the same nanosecond would break.
+    epoch: std.atomic.Value(u64) = .init(0),
+    /// Set by the watcher when it actually shut the stream down.
+    fired: std.atomic.Value(bool) = .init(false),
+    /// `co_bound` as of the fire, read by the request loop after `fired`.
+    fired_co: std.atomic.Value(bool) = .init(false),
+
+    /// Publish the deadline for the request about to go on the wire.
+    fn arm(self: *Watchdog, deadline_ns: u64, co_bound: bool) void {
+        self.co_bound.store(co_bound, .monotonic);
+        self.deadline_ns.store(deadline_ns, .monotonic);
+        // Release so a watcher observing this epoch also observes both stores.
+        _ = self.epoch.fetchAdd(1, .release);
+    }
+
+    /// Withdraw the deadline once the request is off the wire.
+    fn disarm(self: *Watchdog) void {
+        self.deadline_ns.store(0, .monotonic);
+        _ = self.epoch.fetchAdd(1, .release);
+    }
+};
+
+/// Enforces one connection's request deadlines for the connection's whole life.
+///
+/// Sleeps to the in-flight deadline, then shuts the stream down to unblock the
+/// pending read in `performWork` — the same abort mechanism `watchTimer` uses,
+/// hoisted out of the per-request path. Canceled via its group when the
+/// connection tears down, so the stream is never touched after close.
+///
+/// A busy connection wakes this roughly once per timeout period rather than
+/// once per request: by the time the deadline of some earlier request comes
+/// around, thousands may have completed, and the epoch check simply sends it
+/// back to sleep on the current one.
+fn watchConnection(
+    io: Io,
+    stream: *net.Stream,
+    wd: *Watchdog,
+    timeout_ns: u64,
+) void {
+    // How long to wait before re-checking while nothing is on the wire. Only
+    // reached in the gap between two requests, and it cannot oversleep a fresh
+    // deadline because that is a full `timeout_ns` out. Bounds worst-case
+    // detection at deadline + slice.
+    const idle_slice_ns: u64 = @max(timeout_ns / 4, std.time.ns_per_ms);
+
+    while (true) {
+        // Seqlock read: an epoch that moved across the three loads means we
+        // caught a torn arm/disarm, so take the state again.
+        const e1 = wd.epoch.load(.acquire);
+        const deadline = wd.deadline_ns.load(.monotonic);
+        const co_bound = wd.co_bound.load(.monotonic);
+        if (wd.epoch.load(.acquire) != e1) continue;
+
+        if (deadline == 0) {
+            io.sleep(Io.Duration.fromNanoseconds(@intCast(idle_slice_ns)), .awake) catch return;
+            continue;
+        }
+
+        const remaining: i128 = @as(i128, deadline) - now(io).nanoseconds;
+        if (remaining > 0) {
+            io.sleep(Io.Duration.fromNanoseconds(@intCast(remaining)), .awake) catch return;
+            // A short wake leaves the deadline unblown; re-read and wait again
+            // rather than aborting a request that still has time.
+            if (@as(i128, deadline) > now(io).nanoseconds) continue;
+        }
+
+        // Unchanged epoch: the request we timed never left the wire, so this
+        // deadline is genuinely blown. Anything else and the state moved on.
+        if (wd.epoch.load(.acquire) != e1) continue;
+
+        wd.fired_co.store(co_bound, .release);
+        wd.fired.store(true, .release);
+        stream.shutdown(io, .both) catch {};
+        return;
+    }
+}
+
 /// Sleeps for `timeout_ns` then shuts the stream down to unblock the pending
 /// read in `performWork`, signaling a wire timeout or CO deadline miss.
-/// Spawned per active bound per request; canceled (and joined) via its group
-/// when the response arrives first — so the stream is never touched after close.
+/// Used for the once-per-connection HTTP/2 handshake bound; the per-request
+/// bounds go through `Watchdog`/`watchConnection` instead.
 fn watchTimer(
     io: Io,
     stream: *net.Stream,
