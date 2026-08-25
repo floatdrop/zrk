@@ -344,7 +344,16 @@ fn printRunError(io: Io, err: anyerror) !void {
 
 fn writeAll(io: Io, file: Io.File, bytes: []const u8) !void {
     var buf: [256]u8 = undefined;
-    var fw: Io.File.Writer = .init(file, io, &buf);
+    // .init defaults to positional mode (pwrite-style, starting at offset 0
+    // on every fresh Writer). Every call site here constructs a new Writer
+    // per write, so two sequential calls to the same redirected file (e.g.
+    // printUsageError's message line, then the usage block) would each
+    // start writing at byte 0 and clobber one another instead of appending
+    // -- invisible against a terminal or pipe (neither is seekable, so the
+    // position is moot), but silently drops everything but the last write
+    // once stderr/stdout is redirected to a real file. .initStreaming just
+    // writes at the fd's current offset, which is what a log stream wants.
+    var fw: Io.File.Writer = .initStreaming(file, io, &buf);
     try fw.interface.writeAll(bytes);
     try fw.interface.flush();
 }
