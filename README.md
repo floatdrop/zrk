@@ -29,7 +29,7 @@ from the time it *should* have been sent. If the server stalls, backlogged
 requests accrue latency against their intended send time — the stall is
 captured, not smoothed away.
 
-## `--closed`: finding a ceiling instead of chasing one
+## Finding a ceiling instead of chasing one
 
 Coordinated-omission correction has a precondition: you already know a rate
 worth measuring against. That's fine for regression testing ("does this
