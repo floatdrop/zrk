@@ -29,6 +29,30 @@ from the time it *should* have been sent. If the server stalls, backlogged
 requests accrue latency against their intended send time — the stall is
 captured, not smoothed away.
 
+## `--closed`: finding a ceiling instead of chasing one
+
+Coordinated-omission correction has a precondition: you already know a rate
+worth measuring against. That's fine for regression testing ("does this
+service still hold 2000 req/s within its SLO?"), but it doesn't answer a
+different, common question — "what's the most this service, with this many
+connections, can actually sustain?" `-R` can't answer that on its own: pick a
+rate at or under the true ceiling and you've only confirmed the service beats
+your guess; pick one above it and the backlog *from that guess* grows for as
+long as the run keeps pacing sends against a rate the server never agreed to,
+swamping the latency histogram in queueing delay that has nothing to do with
+the server's own response time.
+
+`--closed` drops the schedule and sends each connection's next request the
+instant its previous response completes — the classic wrk/ab model. There's
+no independent send schedule left to correct against, so coordinated-omission
+correction doesn't apply (and zrk says so: the final report reads "latency
+(closed-loop round-trip)", not "corrected"), but the throughput that comes out
+is real: it's however fast `-c` connections and the server, between them,
+actually managed, not a target either side had to hit. That makes it the tool
+for capacity discovery — find the ceiling once with `--closed`, then go back
+to `-R` (below it, for a regression gate) or `-R start:end` (through it, to
+see where latency breaks) now that there's a real number to aim at.
+
 ## Why zrk is more accurate than wrk2
 
 Coordinated-omission correction is only as precise as the clock underneath
@@ -102,6 +126,12 @@ Options:
   -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
   -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps
                             linearly from A to B over the run (default 1000)
+      --closed              Closed-loop mode: ignore -R, send each
+                            connection's next request the instant its
+                            previous response completes (like wrk/ab).
+                            No coordinated-omission correction; the rate
+                            finds its own ceiling instead of chasing one.
+                            Incompatible with a ramp (-R A:B) or --deadline
   -H, --header  <K: V>      Add a request header (repeatable)
   -m, --method      <M>     HTTP method                    (default GET)
   -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
@@ -212,6 +242,10 @@ zrk -c50 -R1000 -d20s --format json -o result.json --hdr latency.hgrm \
 # CI gate: fail the build (exit 3) if p99 regresses past 250ms or errors climb
 zrk -c50 -R1000 -d20s --format json -o result.json \
     --slo-p99 250ms --max-error-rate 1% http://127.0.0.1:8080/
+
+# Closed-loop: what's the real max throughput at 100 connections? No -R to
+# guess — achieved_rate finds its own ceiling instead of chasing one.
+zrk -c100 -d20s --closed http://127.0.0.1:8080/
 ```
 
 The dashboard automatically falls back to append-only lines when stdout is not
@@ -226,7 +260,7 @@ summary object (the live dashboard is suppressed) to stdout or `--output <file>`
 {
   "zrk_version": "0.1.0",
   "target": { "url": "http://127.0.0.1:8080/", "method": "GET" },
-  "config": { "connections": 50, "launched": 50, "duration_s": 20.000, "target_rate": 1000, "timeout_ms": 2000, "deadline_ms": 0, "deadline_abort": false, "record_timeouts": true },
+  "config": { "connections": 50, "launched": 50, "duration_s": 20.000, "closed": false, "target_rate": 1000, "timeout_ms": 2000, "deadline_ms": 0, "deadline_abort": false, "record_timeouts": true },
   "duration_s": 20.002,
   "requests": 19998,
   "bytes": 1239876,
@@ -255,6 +289,11 @@ many runs into one aggregate — none of which the summarized percentiles allow.
 the target load. **If `rate_ratio` is well below 1.0, the client was saturated
 (one request in flight per connection — see Little's law below) and the latency
 numbers reflect client backpressure, not the server: increase `-c`.**
+
+Under `--closed` (`config.closed: true`), there's no offered rate to compare
+against, so `target_rate` mirrors `achieved_rate` and `rate_ratio` is always
+1.0 — a consumer that doesn't special-case `--closed` still gets coherent
+numbers instead of the unrelated default `-R`.
 
 `--hdr <file>` additionally writes the classic HdrHistogram percentile
 distribution (values in milliseconds), directly loadable by the

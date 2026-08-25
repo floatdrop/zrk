@@ -30,6 +30,15 @@ pub const Schedule = union(enum) {
     /// Per-connection ramp: `r0` req/s at t=0, changing by `slope` req/s per
     /// second. `slope` may be negative (ramp down).
     linear: struct { r0: f64, slope: f64 },
+    /// No independent schedule: the next send fires as soon as the previous
+    /// response completes (classic closed-loop, like wrk/ab). There is no
+    /// "intended" send time to solve for from `k` alone — it depends on how
+    /// long the previous response actually took — so `connection.zig` never
+    /// calls `offsetNs`/`rateAt` for this variant; it sets `scheduled` to the
+    /// actual current time instead, which degenerately zeroes out the pacing
+    /// wait, the deadline check, and the CO correction, leaving genuine
+    /// round-trip latency.
+    closed,
 
     /// Constant total `rate` (req/s) split evenly across `connections`.
     pub fn constantTotal(rate: u64, connections: u32) Schedule {
@@ -66,15 +75,20 @@ pub const Schedule = union(enum) {
                 const t = (-l.r0 + @sqrt(disc)) / l.slope;
                 return @intFromFloat(t * ns_per_s);
             },
+            // Unreachable: closed-loop has no k-indexed schedule to solve, so
+            // connection.zig branches on `.closed` before ever calling this.
+            .closed => unreachable,
         }
     }
 
     /// Instantaneous per-connection target rate (req/s) at elapsed `t_s` seconds
-    /// — used to annotate the offered load in the time-series report.
+    /// — used to annotate the offered load in the time-series report. Not
+    /// meaningful for `.closed`, which has no offered rate; unused there too.
     pub fn rateAt(self: Schedule, t_s: f64) f64 {
         return switch (self) {
             .constant => |c| if (c.interval_ns > 0) ns_per_s / c.interval_ns else 0,
             .linear => |l| l.r0 + l.slope * t_s,
+            .closed => 0,
         };
     }
 };
@@ -82,6 +96,16 @@ pub const Schedule = union(enum) {
 // --- tests -------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "closed schedule has no offered rate" {
+    // rateAt is unused for .closed outside this test (connection.zig sets
+    // `scheduled = now` directly instead of consulting the schedule), but it
+    // must still return something inert rather than being unreachable, since
+    // Schedule.closed is a real value connection.zig holds in Params.
+    const s: Schedule = .closed;
+    try testing.expectApproxEqAbs(@as(f64, 0), s.rateAt(0), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 0), s.rateAt(10), 1e-9);
+}
 
 test "constant schedule spaces sends evenly" {
     // 1000 req/s over 10 connections => 100 req/s per conn => 10ms interval.

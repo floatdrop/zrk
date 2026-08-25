@@ -68,9 +68,17 @@ pub fn writeJson(
     const achieved: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.completed)) / elapsed_s else 0;
     const bps: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.bytes)) / elapsed_s else 0;
     // For a ramp, compare achieved throughput against the *average* offered rate
-    // (start+end)/2; for a constant run this is just the rate.
+    // (start+end)/2; for a constant run this is just the rate. In --closed mode
+    // there is no offered rate to compare against — report target == achieved
+    // (rate_ratio == 1) so a consumer that doesn't special-case --closed still
+    // gets coherent numbers instead of the unrelated default `rate`.
     const rate_end = cfg.rate_end orelse cfg.rate;
-    const avg_target: f64 = (@as(f64, @floatFromInt(cfg.rate)) + @as(f64, @floatFromInt(rate_end))) / 2.0;
+    const target_rate: u64 = if (cfg.closed) @intFromFloat(@round(achieved)) else cfg.rate;
+    const target_rate_end: u64 = if (cfg.closed) target_rate else rate_end;
+    const avg_target: f64 = if (cfg.closed)
+        achieved
+    else
+        (@as(f64, @floatFromInt(cfg.rate)) + @as(f64, @floatFromInt(rate_end))) / 2.0;
 
     try w.writeAll("{\n");
     try w.print("  \"zrk_version\": \"{s}\",\n", .{cli.version});
@@ -83,11 +91,12 @@ pub fn writeJson(
 
     try w.writeAll("  \"config\": {");
     try w.print(
-        " \"connections\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"target_rate\": {d}, \"timeout_ms\": {d}, \"deadline_ms\": {d}, \"deadline_abort\": {}, \"record_timeouts\": {} }},\n",
+        " \"connections\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"closed\": {}, \"target_rate\": {d}, \"timeout_ms\": {d}, \"deadline_ms\": {d}, \"deadline_abort\": {}, \"record_timeouts\": {} }},\n",
         .{
             cfg.connections,
             launched,
             @as(f64, @floatFromInt(cfg.duration_ns)) / std.time.ns_per_s,
+            cfg.closed,
             cfg.rate,
             cfg.timeout_ns / std.time.ns_per_ms,
             cfg.deadline_ns / std.time.ns_per_ms,
@@ -104,8 +113,8 @@ pub fn writeJson(
     try w.print("  \"requests\": {d},\n", .{c.completed});
     try w.print("  \"bytes\": {d},\n", .{c.bytes});
     try w.print("  \"achieved_rate\": {d:.2},\n", .{achieved});
-    try w.print("  \"target_rate\": {d},\n", .{cfg.rate});
-    try w.print("  \"target_rate_end\": {d},\n", .{rate_end});
+    try w.print("  \"target_rate\": {d},\n", .{target_rate});
+    try w.print("  \"target_rate_end\": {d},\n", .{target_rate_end});
     try w.print("  \"rate_ratio\": {d:.4},\n", .{if (avg_target > 0) achieved / avg_target else 0});
     try w.print("  \"bytes_per_sec\": {d:.2},\n", .{bps});
     try w.print("  \"error_rate\": {d:.6},\n", .{errorRate(c)});
@@ -179,6 +188,8 @@ pub const TimeSeries = struct {
     }
 
     /// Offered *total* target rate (req/s) at elapsed `t_s`, honoring a ramp.
+    /// `.closed` has no offered rate; the caller substitutes the interval's
+    /// own achieved rate instead (rate_ratio == 1 there too).
     fn targetRate(self: *const TimeSeries, t_s: f64) f64 {
         const start: f64 = @floatFromInt(self.cfg.rate);
         const end_rate = self.cfg.rate_end orelse return start;
@@ -207,7 +218,7 @@ pub const TimeSeries = struct {
                 "\"bytes\":{d},\"bytes_per_sec\":{d:.1}," ++
                 "\"latency_us\":{{\"p50\":{d},\"p90\":{d},\"p99\":{d},\"p99_9\":{d},\"max\":{d}}}",
             .{
-                elapsed_s,                 self.targetRate(elapsed_s),
+                elapsed_s,                 if (self.cfg.closed) achieved else self.targetRate(elapsed_s),
                 achieved,                  d_completed,
                 d_errors,                  d_bytes,
                 bps,                       h.valueAtPercentile(50),
@@ -321,6 +332,34 @@ test "writeJson emits parseable, well-formed summary" {
     try testing.expect(std.mem.indexOf(u8, out, "\"max_schedule_lag_us\": 12") != null);
     // The embedded HdrHistogram blob is present and decodes back to 100 samples.
     try testing.expect(std.mem.indexOf(u8, out, "\"latency_histogram\": \"HIST") != null);
+}
+
+test "writeJson reports target_rate as achieved under --closed" {
+    var snap: stats.Snapshot = .{
+        .hist = try stats.newHistogram(testing.allocator),
+        .counters = .{},
+    };
+    defer snap.deinit();
+
+    snap.counters.completed = 500; // 500 requests / 1.0s => achieved_rate 500
+    snap.counters.recordStatus(200);
+
+    var alloc = Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    var cfg = testConfig();
+    cfg.closed = true; // cfg.rate is still the unrelated default 1000
+    try writeJson(testing.allocator, &alloc.writer, &cfg, &snap, 1.0, 4, false);
+    const out = alloc.written();
+
+    try testing.expect(std.mem.indexOf(u8, out, "\"closed\": true") != null);
+    // Both the top-level target_rate/target_rate_end and rate_ratio track the
+    // achieved rate, not the ignored `-R` default -- a consumer that doesn't
+    // know about --closed still sees a coherent 1.0 ratio instead of a
+    // meaningless comparison against 1000.
+    try testing.expect(std.mem.indexOf(u8, out, "\"achieved_rate\": 500.00") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"target_rate\": 500,") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"target_rate_end\": 500,") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"rate_ratio\": 1.0000") != null);
 }
 
 test "time series row carries the interval HDR blob when enabled" {

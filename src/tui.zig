@@ -245,6 +245,7 @@ pub const Dashboard = struct {
         const v_total = clock(&vbuf[1], total_s);
 
         // Offered load right now — for a ramp, the interpolated schedule.
+        // Meaningless in --closed mode, which has no offered rate to show.
         const r0: f64 = @floatFromInt(self.cfg.rate);
         const offered_now: f64 = if (self.cfg.rate_end) |e| blk: {
             const frac = if (total_s > 0) @min(elapsed_s / total_s, 1.0) else 1.0;
@@ -259,8 +260,9 @@ pub const Dashboard = struct {
 
         // The client failing to hold the schedule is zrk's #1 diagnostic
         // (rate_ratio / Little's law): paint the achieved rate red. Skip the
-        // first seconds while the fleet is still connecting.
-        const behind = elapsed_s >= 2 and rate < 0.95 * offered_now;
+        // first seconds while the fleet is still connecting. Never applies in
+        // --closed mode, which has no schedule to fall behind.
+        const behind = !self.cfg.closed and elapsed_s >= 2 and rate < 0.95 * offered_now;
 
         // A fixed three-line status, all indented to `stat_col`: the clock
         // lives alone in the left gutter (above the pXX labels) so its widening
@@ -290,10 +292,14 @@ pub const Dashboard = struct {
         try w.print("{s}{s} / {s}{s}", .{ v_time, k.dim, v_total, k.reset });
         const timer_w = 2 + v_time.len + 3 + v_total.len; // "● " + clock + " / "
         try padTo(w, @max(stat_col -| timer_w, 1));
-        try self.segLine(w, &.{
-            .{ .label = "offered ", .text = v_offered },
-            .{ .label = "achieved ", .text = v_achieved, .color = if (behind) k.red else "" },
-        });
+        if (self.cfg.closed) {
+            try self.segLine(w, &.{.{ .label = "rate ", .text = v_achieved }});
+        } else {
+            try self.segLine(w, &.{
+                .{ .label = "offered ", .text = v_offered },
+                .{ .label = "achieved ", .text = v_achieved, .color = if (behind) k.red else "" },
+            });
+        }
         try padTo(w, stat_col);
         try self.segLine(w, &.{.{ .label = "transfer ", .text = v_transfer }});
         lines += 2;
@@ -659,7 +665,11 @@ pub const Dashboard = struct {
         try writeBytes(w, bps);
         try w.writeAll("/s\n");
 
-        try w.writeAll("  latency (coordinated-omission corrected)\n");
+        if (self.cfg.closed) {
+            try w.writeAll("  latency (closed-loop round-trip)\n");
+        } else {
+            try w.writeAll("  latency (coordinated-omission corrected)\n");
+        }
         try self.line(w, "p50", snap.hist.valueAtPercentile(50));
         try self.line(w, "p75", snap.hist.valueAtPercentile(75));
         try self.line(w, "p90", snap.hist.valueAtPercentile(90));

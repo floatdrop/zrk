@@ -110,10 +110,13 @@ pub fn run(
 
     var stop = std.atomic.Value(bool).init(false);
 
-    // Per-connection send schedule: a constant spacing, or a linear ramp from
-    // `rate` to `rate_end` over the run, split evenly across connections.
+    // Per-connection send schedule: no schedule at all in --closed mode, else
+    // a constant spacing or a linear ramp from `rate` to `rate_end`, split
+    // evenly across connections.
     const duration_s: f64 = @as(f64, @floatFromInt(cfg.duration_ns)) / std.time.ns_per_s;
-    const schedule = if (cfg.rate_end) |end_rate|
+    const schedule: pace.Schedule = if (cfg.closed)
+        .closed
+    else if (cfg.rate_end) |end_rate|
         pace.Schedule.linearTotal(cfg.rate, end_rate, cfg.connections, duration_s)
     else
         pace.Schedule.constantTotal(cfg.rate, cfg.connections);

@@ -45,6 +45,15 @@ pub const Config = struct {
     /// End rate for a linear ramp (null = constant `rate`). When set, the total
     /// target rate ramps linearly from `rate` to `rate_end` over the duration.
     rate_end: ?u64 = null,
+    /// Closed-loop mode (`--closed`): ignore `-R` and send each connection's
+    /// next request the instant its previous response completes, like
+    /// wrk/ab. Trades away coordinated-omission correction (there is no
+    /// independent schedule left to correct against) for a rate that finds
+    /// its own ceiling — the server's real capacity at `-c` connections —
+    /// instead of being handed one to chase. Incompatible with `-R`'s ramp
+    /// form and with `--deadline`, both of which presuppose an offered
+    /// schedule to fall behind.
+    closed: bool = false,
     /// Per-request wire timeout: bounds the attempt on the wire, measured from
     /// the actual send (catches a hung socket / dead server). Does *not* bound
     /// coordinated-omission latency under overload — see `deadline_ns`.
@@ -140,6 +149,8 @@ pub const ParseError = error{
     ZeroRate,
     ZeroInterval,
     ZeroRefresh,
+    ClosedWithRamp,
+    ClosedWithDeadline,
     OutOfMemory,
 };
 
@@ -172,6 +183,12 @@ pub const usage =
     \\  -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
     \\  -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps
     \\                            linearly from A to B over the run (default 1000)
+    \\      --closed              Closed-loop mode: ignore -R, send each
+    \\                            connection's next request the instant its
+    \\                            previous response completes (like wrk/ab).
+    \\                            No coordinated-omission correction; the rate
+    \\                            finds its own ceiling instead of chasing one.
+    \\                            Incompatible with a ramp (-R A:B) or --deadline
     \\  -H, --header  <K: V>      Add a request header (repeatable)
     \\  -m, --method      <M>     HTTP method                    (default GET)
     \\  -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
@@ -258,6 +275,8 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
             cfg.insecure = true;
         } else if (eq(arg, "--plain") or eq(arg, "--no-tui")) {
             cfg.plain = true;
+        } else if (eq(arg, "--closed")) {
+            cfg.closed = true;
         } else if (eq(arg, "--no-record-timeouts")) {
             cfg.record_timeouts = false;
         } else if (eq(arg, "--record-timeouts")) {
@@ -333,6 +352,11 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
     if (cfg.interval_ns == 0) return error.ZeroInterval;
     // Same busy-loop hazard for the dashboard redraw cadence.
     if (cfg.refresh_ns == 0) return error.ZeroRefresh;
+    // Both presuppose an offered schedule that closed-loop mode doesn't have:
+    // a ramp has nothing to ramp, and there's no scheduled send time to fall
+    // behind for --deadline to measure against.
+    if (cfg.closed and cfg.rate_end != null) return error.ClosedWithRamp;
+    if (cfg.closed and cfg.deadline_ns != 0) return error.ClosedWithDeadline;
 
     const raw_url = url_arg orelse return error.MissingUrl;
     cfg.url = try parseUrl(raw_url);
@@ -551,6 +575,29 @@ test "deadline flag parses; defaults off" {
     try testing.expect(!cfg.deadline_abort);
     const aborting = (try parse(a, &[_][]const u8{ "--deadline", "250ms", "--deadline-abort", "http://x/" })).config;
     try testing.expect(aborting.deadline_abort);
+}
+
+test "closed flag parses; rejects ramp and deadline" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Off by default.
+    const default = (try parse(a, &[_][]const u8{"http://x/"})).config;
+    try testing.expect(!default.closed);
+
+    const cfg = (try parse(a, &[_][]const u8{ "--closed", "-c", "100", "http://x/" })).config;
+    try testing.expect(cfg.closed);
+    try testing.expectEqual(@as(u32, 100), cfg.connections);
+
+    // A ramp end and --deadline both presuppose a schedule --closed doesn't have.
+    try testing.expectError(error.ClosedWithRamp, parse(a, &[_][]const u8{ "--closed", "-R", "100:5000", "http://x/" }));
+    try testing.expectError(error.ClosedWithDeadline, parse(a, &[_][]const u8{ "--closed", "--deadline", "250ms", "http://x/" }));
+
+    // A plain (non-ramp) -R alongside --closed is accepted (rate is ignored,
+    // not rejected) since a scalar -R can't be told apart from the default.
+    const with_rate = (try parse(a, &[_][]const u8{ "--closed", "-R", "5000", "http://x/" })).config;
+    try testing.expect(with_rate.closed);
 }
 
 test "refresh flag parses and zero is rejected" {
