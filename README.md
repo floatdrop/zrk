@@ -404,7 +404,7 @@ const report = try zrk.runner.run(arena.allocator(), io, &cfg, 0, null, null);
 |------|----------------|
 | `src/hdr.zig` | Minimal HdrHistogram (record, percentiles, merge). |
 | `src/cli.zig` | Argument / URL / duration parsing → `Config`. |
-| `src/http.zig` | Request builder and response parser (Content-Length + chunked). |
+| `src/http.zig` | Request builder (HTTP/1.1 bytes and the HPACK block); response framing is [zurl](https://github.com/zoxy-io/zurl)'s. |
 | `src/connection.zig` | The per-connection pacing loop (the coordinated-omission core). |
 | `src/tls.zig` | TLS session setup over a stream (system CA bundle, `-k`). |
 | `src/stats.zig` | Per-connection state ownership + snapshot/final aggregation. |

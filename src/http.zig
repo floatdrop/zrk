@@ -4,9 +4,17 @@
 //! needs enough of the response to (a) learn the status class, (b) consume the
 //! body so the connection stays framed for the next request, and (c) count
 //! bytes for throughput. It deliberately does not retain header or body content.
+//!
+//! Response framing is zurl's, not ours. Building the request stays here: zrk
+//! builds it once and replays the bytes on every send, which zurl's
+//! `writeRequest` cannot do — it re-serializes per call, 93-103 ns against 2.6
+//! ns for writing the prebuilt blob, on a hot path that runs millions of times.
+//! So this file owns what is fixed for the whole run, and zurl owns what
+//! arrives from a server we do not control.
 
 const std = @import("std");
 const h2 = @import("h2");
+const zurl = @import("zurl");
 const Io = std.Io;
 const cli = @import("cli.zig");
 
@@ -233,125 +241,93 @@ pub const RequestMethod = enum {
     pub fn of(method: []const u8) RequestMethod {
         return if (std.ascii.eqlIgnoreCase(method, "HEAD")) .head else .other;
     }
+
+    /// What zurl's `streamBody` takes. Only the HEAD/not-HEAD distinction
+    /// survives the trip, because that is the only thing a method decides
+    /// about a RESPONSE — and it is what lets `-m` keep taking any string at
+    /// all: `std.http.Method` is a closed enum of nine and cannot name
+    /// `PROPPATCH`, while nothing downstream of here needs it to.
+    pub fn toStd(m: RequestMethod) std.http.Method {
+        return switch (m) {
+            .head => .HEAD,
+            .other => .GET,
+        };
+    }
 };
 
 /// Parse one HTTP/1.1 response from `r`, consuming its full body so the reader
 /// is positioned at the start of the next response. `method` is the request's
-/// framing classification (see `RequestMethod`). `r`'s buffer capacity must be
-/// large enough to hold the longest single header line.
+/// framing classification (see `RequestMethod`).
+///
+/// `r`'s buffer must be able to hold the response's ENTIRE head, not merely
+/// its longest header line as the hand-rolled parser this replaces needed:
+/// zurl scans a contiguous slice, so the buffer is the bound. Connections size
+/// theirs at `read_buffer_size`, which is 16 KiB against a 64 KiB
+/// `max_head_bytes` default, so the buffer is what a real server would hit
+/// first — and `error.HeaderTooLong` is what it hits.
 pub fn parseResponse(r: *Io.Reader, method: RequestMethod) ParseError!Response {
-    var bytes: u64 = 0;
+    // The body goes nowhere: zrk measures responses, it does not read them.
+    // The sink is how zurl hands bytes over, and `Discarding` is the one that
+    // counts them and drops them — its drain cannot fail, which is why the
+    // `WriteFailed` arm of `mapError` is unreachable in this caller.
+    var discard_buf: [512]u8 = undefined;
+    var discarding: Io.Writer.Discarding = .init(&discard_buf);
 
-    // Status line: "HTTP/1.1 200 OK\r\n"
-    const status_line = takeLine(r, &bytes) catch return error.MalformedStatusLine;
-    const status = parseStatus(status_line) catch return error.MalformedStatusLine;
+    const head = zurl.parser.parseHead(r, parse_options) catch |err| return mapError(err);
+    const body = zurl.parser.streamBody(
+        r,
+        head,
+        method.toStd(),
+        &discarding.writer,
+        parse_options,
+    ) catch |err| return mapError(err);
 
-    var content_length: ?u64 = null;
-    var chunked = false;
-    // Default keep-alive is true for HTTP/1.1 unless the server says otherwise.
-    var keep_alive = std.mem.startsWith(u8, status_line, "HTTP/1.1");
-
-    // Headers, one per line, terminated by a blank line.
-    while (true) {
-        const line = takeLine(r, &bytes) catch return error.MalformedHeader;
-        if (line.len == 0) break; // blank line: end of headers
-
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedHeader;
-        const name = line[0..colon];
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-
-        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            content_length = std.fmt.parseInt(u64, value, 10) catch return error.MalformedHeader;
-        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-            if (asciiContainsIgnoreCase(value, "chunked")) chunked = true;
-        } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
-            if (asciiContainsIgnoreCase(value, "close")) {
-                keep_alive = false;
-            } else if (asciiContainsIgnoreCase(value, "keep-alive")) {
-                keep_alive = true;
-            }
-        }
-    }
-
-    // Body. HEAD responses and 1xx/204/304 statuses never carry one, whatever
-    // Content-Length or Transfer-Encoding claim (RFC 9112 §6.3) — consuming a
-    // body there would eat into the next response and break framing.
-    const bodyless = method == .head or status == 204 or status == 304 or status / 100 == 1;
-    if (bodyless) {
-        // Nothing to consume.
-    } else if (chunked) {
-        try consumeChunkedBody(r, &bytes);
-    } else if (content_length) |len| {
-        discard(r, len, &bytes) catch return error.UnexpectedEof;
-    } else {
-        // No framing info: the body runs to connection close, which precludes
-        // keep-alive.
-        keep_alive = false;
-    }
-
-    return .{ .status = status, .bytes = bytes, .keep_alive = keep_alive };
-}
-
-/// Read a CRLF-terminated line, return it without the trailing CRLF, and add
-/// the raw byte count (including CRLF) to `bytes`.
-fn takeLine(r: *Io.Reader, bytes: *u64) !([]const u8) {
-    const raw = r.takeDelimiterInclusive('\n') catch |err| switch (err) {
-        error.StreamTooLong => return error.HeaderTooLong,
-        error.EndOfStream => return error.UnexpectedEof,
-        error.ReadFailed => return error.ReadFailed,
+    return .{
+        .status = head.status,
+        // What the response cost on the wire, which is what `Transfer/sec`
+        // reports and what wrk means by it: the head, and the body including
+        // chunk-size lines, their CRLFs and any trailer section. `body.len`
+        // would be the DECODED size and would under-report every chunked
+        // response by exactly its framing.
+        .bytes = head.head_len + body.wire_len,
+        // The exchange's verdict rather than the head's: a close-delimited
+        // body forces the connection shut whatever the headers claimed.
+        .keep_alive = body.keep_alive,
     };
-    bytes.* += raw.len;
-    var line = raw;
-    if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
-    if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-    return line;
 }
 
-fn parseStatus(status_line: []const u8) !u16 {
-    // "HTTP/1.1 200 OK" -> take the token after the first space.
-    const first_space = std.mem.indexOfScalar(u8, status_line, ' ') orelse return error.MalformedStatusLine;
-    const after = status_line[first_space + 1 ..];
-    const code_end = std.mem.indexOfScalar(u8, after, ' ') orelse after.len;
-    const code = std.fmt.parseInt(u16, after[0..code_end], 10) catch return error.MalformedStatusLine;
-    // Status codes are exactly three digits (RFC 9112 §4). Enforcing that here
-    // keeps every counted status inside the 1xx..5xx+ class buckets.
-    if (code < 100 or code > 999) return error.MalformedStatusLine;
-    return code;
-}
+/// How zrk reads a response, fixed for the whole run.
+const parse_options: zurl.HeadOptions = .{
+    // zrk sends no `accept-encoding`, but an origin may compress anyway, and a
+    // compressed response is still a response that arrived: it has a status,
+    // it has a length, and zrk never looks inside it. Left at the default,
+    // every request against such a target would fail with
+    // `UnsupportedContentEncoding` and the run would report the target broken
+    // when it was us being fussy about bytes we discard.
+    .allow_encoded_body = true,
+    // No `on_header`: zrk retains nothing, and the callback would run on every
+    // header of every response for the whole run.
+};
 
-fn consumeChunkedBody(r: *Io.Reader, bytes: *u64) ParseError!void {
-    while (true) {
-        const size_line = takeLine(r, bytes) catch return error.MalformedChunk;
-        // Chunk size is hex, optionally followed by ";extensions".
-        const semi = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
-        const size = std.fmt.parseInt(u64, size_line[0..semi], 16) catch return error.MalformedChunk;
-        if (size == 0) {
-            // Trailing headers (if any) until a blank line, then done.
-            while (true) {
-                const line = takeLine(r, bytes) catch return error.MalformedChunk;
-                if (line.len == 0) break;
-            }
-            return;
-        }
-        discard(r, size, bytes) catch return error.MalformedChunk;
-        // Each chunk's data is followed by a CRLF.
-        _ = takeLine(r, bytes) catch return error.MalformedChunk;
-    }
-}
-
-fn discard(r: *Io.Reader, n: u64, bytes: *u64) !void {
-    r.discardAll64(n) catch return error.UnexpectedEof;
-    bytes.* += n;
-}
-
-fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
+/// zurl's parser errors in zrk's vocabulary.
+///
+/// Two arms cannot fire under `parse_options` and are still mapped rather than
+/// left `unreachable`: `unreachable` is undefined behaviour in ReleaseFast,
+/// which is the mode every release binary is built in, and the caller buckets
+/// all of these as one read error anyway.
+fn mapError(err: zurl.parser.Error) ParseError {
+    return switch (err) {
+        error.MalformedStatusLine => error.MalformedStatusLine,
+        error.MalformedHeader => error.MalformedHeader,
+        error.MalformedChunk => error.MalformedChunk,
+        error.UnexpectedEof => error.UnexpectedEof,
+        error.HeadTooLong => error.HeaderTooLong,
+        error.ReadFailed => error.ReadFailed,
+        // The sink is a `Discarding` writer and cannot fail.
+        error.WriteFailed => error.ReadFailed,
+        // Refused only when `allow_encoded_body` is false, and it is not.
+        error.UnsupportedContentEncoding => error.ReadFailed,
+    };
 }
 
 // --- tests -------------------------------------------------------------------
@@ -468,6 +444,53 @@ test "RequestMethod.of classifies HEAD case-insensitively" {
     try testing.expectEqual(RequestMethod.head, RequestMethod.of("head"));
     try testing.expectEqual(RequestMethod.other, RequestMethod.of("GET"));
     try testing.expectEqual(RequestMethod.other, RequestMethod.of("PROPPATCH"));
+    // A method `std.http.Method` cannot name still reaches the parser as the
+    // only thing the parser uses a method for: not-HEAD.
+    try testing.expectEqual(std.http.Method.GET, RequestMethod.of("PROPPATCH").toStd());
+    try testing.expectEqual(std.http.Method.HEAD, RequestMethod.of("head").toStd());
+}
+
+test "a compressed body is measured, not refused" {
+    // zurl refuses a `content-encoding` it cannot decode, on the grounds that
+    // its callers read bodies. zrk opts out because it discards them: a gzip
+    // response has a status, a length and a latency like any other, and left
+    // at zurl's default every request against a compressing origin would fail
+    // and the run would report that target down.
+    const raw = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\n\r\n\x1f\x8b\x08\x00";
+    var r = Io.Reader.fixed(raw);
+    const resp = try parseResponse(&r, .other);
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    try testing.expectEqual(@as(u64, raw.len), resp.bytes);
+    try testing.expect(resp.keep_alive);
+}
+
+test "conflicting Content-Length is refused rather than guessed" {
+    // A request-smuggling primitive: two lengths let an intermediary and an
+    // origin disagree about where the body ends. The hand-rolled parser took
+    // the last one silently and stayed framed on whichever it picked; zurl
+    // refuses, and a load generator has no business preferring one.
+    const raw = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 9\r\n\r\nhello";
+    var r = Io.Reader.fixed(raw);
+    try testing.expectError(error.MalformedHeader, parseResponse(&r, .other));
+
+    // Duplicates that AGREE are tolerated: some proxies stack them, and there
+    // is nothing to disagree about.
+    const agreeing = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+    var ok = Io.Reader.fixed(agreeing);
+    const resp = try parseResponse(&ok, .other);
+    try testing.expectEqual(@as(u64, agreeing.len), resp.bytes);
+}
+
+test "chunk framing counts toward Transfer/sec, decoded length does not" {
+    // The distinction `Response.bytes` exists for. Nine bytes of payload
+    // arrive inside 24 bytes of body wire, and a meter that reported the
+    // former would under-report every chunked target it ever measured.
+    const body = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    const raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++ body;
+    var r = Io.Reader.fixed(raw);
+    const resp = try parseResponse(&r, .other);
+    try testing.expectEqual(@as(u64, raw.len), resp.bytes);
+    try testing.expect(resp.bytes > raw.len - body.len + 9);
 }
 
 test "parseResponse HEAD ignores Content-Length and stays framed" {
