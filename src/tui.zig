@@ -79,6 +79,16 @@ const Colors = struct {
     }
 };
 
+/// DEC private mode 2026 — synchronized output. Between these two the
+/// terminal holds its display still and presents the result as one finished
+/// frame, so a repaint is never caught mid-erase: without them `\x1b[J` blanks
+/// the panel and the next ~1KB-15KB of cells fill it back in wherever the
+/// terminal happens to draw, which at the 80ms default refresh is a visible
+/// flicker on every frame. Terminals that don't implement it ignore both as
+/// unknown private modes, so there is nothing to detect and no fallback.
+const sync_begin = "\x1b[?2026h";
+const sync_end = "\x1b[?2026l";
+
 pub const Dashboard = struct {
     io: Io,
     cfg: *const cli.Config,
@@ -206,8 +216,7 @@ pub const Dashboard = struct {
             // that rewraps old lines can leave artifacts for one frame; the
             // next repaint absorbs them.)
             self.term_cols = termWidth(self.file);
-            if (self.prev_lines > 0) try w.print("\r\x1b[{d}A\x1b[J", .{self.prev_lines});
-            self.prev_lines = try self.drawPanel(w, snap, rate, bps, elapsed_s, total_s, false);
+            try self.repaint(w, snap, rate, bps, elapsed_s, total_s, false);
         } else {
             try w.print("[{d:6.1}s] {d:8.0} req/s {f}/s  p50={f} p99={f} p99.9={f} max={f}  errs={d}\n", .{
                 elapsed_s,                               rate,
@@ -217,6 +226,37 @@ pub const Dashboard = struct {
             });
         }
         try self.fw.interface.flush();
+    }
+
+    /// Erase the previous frame and draw a new one inside a single synchronized
+    /// update, recording the new height for the next repaint. Shared by the live
+    /// frame and the settled final panel so the two can't drift — and so the
+    /// invariant that every `sync_begin` is matched lives in exactly one place.
+    ///
+    /// `term_cols` is the caller's to refresh: both call sites re-read it from
+    /// the terminal first, which leaves tests free to pin a width.
+    fn repaint(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, rate: f64, bps: f64, elapsed_s: f64, total_s: f64, finished: bool) !void {
+        try w.writeAll(sync_begin);
+        // A frame that dies between the two sequences leaves the terminal
+        // holding its display with nothing left to release it — that reads as a
+        // hung program rather than a failed paint, and no later frame reopens it
+        // because a failed dashboard is not called again. Closing has to reach
+        // the terminal, not just the buffer: a colored panel outruns the 8KiB
+        // buffer, so `sync_begin` may already have gone out on an auto-flush.
+        // Best-effort by construction — whatever broke the frame most likely
+        // breaks these too, and there is no better move left either way.
+        errdefer closeSync(w);
+        if (self.prev_lines > 0) try w.print("\r\x1b[{d}A\x1b[J", .{self.prev_lines});
+        self.prev_lines = try self.drawPanel(w, snap, rate, bps, elapsed_s, total_s, finished);
+        try w.writeAll(sync_end);
+    }
+
+    /// Release a synchronized update that a failed frame left open (see
+    /// `repaint`). Silent: the caller is already unwinding an error worth more
+    /// than anything these two writes could report.
+    fn closeSync(w: *Io.Writer) void {
+        w.writeAll(sync_end) catch {};
+        w.flush() catch {};
     }
 
     /// One status segment: a dim label and a (possibly colored) value.
@@ -626,8 +666,7 @@ pub const Dashboard = struct {
             const bps: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.bytes)) / elapsed_s else 0;
             const total_s: f64 = @as(f64, @floatFromInt(self.cfg.duration_ns)) / std.time.ns_per_s;
             self.term_cols = termWidth(self.file);
-            if (self.prev_lines > 0) try w.print("\r\x1b[{d}A\x1b[J", .{self.prev_lines});
-            self.prev_lines = try self.drawPanel(w, snap, rate, bps, elapsed_s, total_s, true);
+            try self.repaint(w, snap, rate, bps, elapsed_s, total_s, true);
         } else {
             try self.writeFinalSummary(w, snap, elapsed_s);
         }
@@ -883,6 +922,60 @@ test "a requested stop shows on the panel without breaking its line accounting" 
     try testing.expect(std.mem.indexOf(u8, final_out.written(), "✕") != null);
     try testing.expect(std.mem.indexOf(u8, final_out.written(), "signal again") == null);
     try testing.expect(std.mem.indexOf(u8, final_out.written(), "stopped early") != null);
+}
+
+test "a live repaint is bracketed by exactly one synchronized update" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io_ = rt.io();
+
+    const cfg = cli.Config{ .url = try cli.parseUrl("http://127.0.0.1/") };
+    var dash_buf: [64]u8 = undefined;
+    var dash = Dashboard.init(io_, &cfg, .empty, &dash_buf);
+    dash.colors = .{}; // no SGR, so the only escapes left are the ones under test
+    dash.term_cols = 120;
+
+    var snap: stats.Snapshot = .{ .hist = try stats.newHistogram(testing.allocator), .counters = .{} };
+    defer snap.deinit();
+    snap.hist.record(1000);
+    snap.counters.completed = 100;
+    snap.counters.recordStatus(200);
+
+    var first = Io.Writer.Allocating.init(testing.allocator);
+    defer first.deinit();
+    try dash.repaint(&first.writer, &snap, 100, 1000, 1.0, 30.0, false);
+    const f = first.written();
+
+    // The whole frame sits inside the update: opened before anything is drawn
+    // (the erase included — mid-erase is exactly the state being hidden) and
+    // closed only once the last cell is out.
+    try testing.expect(std.mem.startsWith(u8, f, sync_begin));
+    try testing.expect(std.mem.endsWith(u8, f, sync_end));
+    // Balanced, and nothing else escapes: an unmatched or duplicated open would
+    // leave the terminal holding its display, which looks like a hung run.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, f, sync_begin));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, f, sync_end));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, f, "\x1b"));
+    // The bracket carries no newlines, so `prev_lines` still counts panel rows
+    // and the next repaint moves up exactly as far as it did before.
+    try testing.expectEqual(std.mem.count(u8, f, "\n"), dash.prev_lines);
+
+    // The second frame erases the first from *inside* the update — the point of
+    // the bracket — and is still opened and closed exactly once.
+    var second = Io.Writer.Allocating.init(testing.allocator);
+    defer second.deinit();
+    const before = dash.prev_lines;
+    try dash.repaint(&second.writer, &snap, 100, 1000, 2.0, 30.0, false);
+    const g = second.written();
+
+    var cursor_up_buf: [16]u8 = undefined;
+    const cursor_up = try std.fmt.bufPrint(&cursor_up_buf, "\r\x1b[{d}A\x1b[J", .{before});
+    const up_at = std.mem.indexOf(u8, g, cursor_up) orelse return error.NoRepaintSeek;
+    try testing.expect(up_at > std.mem.indexOf(u8, g, sync_begin).?);
+    try testing.expect(up_at < std.mem.indexOf(u8, g, sync_end).?);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, g, sync_begin));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, g, sync_end));
+    try testing.expectEqual(std.mem.count(u8, g, "\n"), dash.prev_lines);
 }
 
 test "spectrogram renders a bimodal interval as two separated clusters" {
