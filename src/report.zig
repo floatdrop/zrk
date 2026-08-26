@@ -17,9 +17,18 @@ const connection = @import("connection.zig");
 /// overload the rate reflects the fraction of the offered schedule that could
 /// not be served within the deadline. 0 when idle.
 pub fn errorRate(c: connection.Counters) f64 {
-    const failures = c.socketErrors() + c.deadline_errors;
-    const errs = c.status_errors + failures;
-    const total = c.completed + failures;
+    return failureFraction(c.completed, c.status_errors, c.socketErrors() + c.deadline_errors);
+}
+
+/// The arithmetic behind both `errorRate` and the per-interval `error_rate` row
+/// field, factored out so the summary and the time series cannot drift apart.
+/// `failures` are the attempts that never produced a response (socket errors and
+/// deadline misses); each counts as an error *and* as an attempt, so a window
+/// spent shedding a backlog reports a rate near 1 rather than dividing by the
+/// handful of requests that got through.
+fn failureFraction(completed: u64, status_errs: u64, failures: u64) f64 {
+    const errs = status_errs + failures;
+    const total = completed + failures;
     if (total == 0) return 0;
     return @as(f64, @floatFromInt(errs)) / @as(f64, @floatFromInt(total));
 }
@@ -166,9 +175,10 @@ pub const TimeSeries = struct {
     /// transient encode buffers never accumulate in the caller's arena when
     /// `--timeseries-histogram` is on. Backed by the page allocator.
     scratch: std.heap.ArenaAllocator,
-    prev_completed: u64 = 0,
-    prev_bytes: u64 = 0,
-    prev_errors: u64 = 0,
+    /// Previous cumulative counters: every count in a row is `snap - prev`.
+    /// `max_behind_ns` is the exception — it is a running peak, not a tally,
+    /// so it is reported as-is rather than differenced (see `record`).
+    prev_counters: connection.Counters = .{},
     prev_elapsed_s: f64 = 0,
 
     pub fn init(arena: std.mem.Allocator, w: *Io.Writer, cfg: *const cli.Config) !TimeSeries {
@@ -205,25 +215,59 @@ pub const TimeSeries = struct {
         self.delta.setToDifference(&snap.hist, &self.prev_cum);
         const h = &self.delta;
 
+        const c = snap.counters;
+        const p = self.prev_counters;
         const interval_s = elapsed_s - self.prev_elapsed_s;
-        const d_completed = snap.counters.completed -| self.prev_completed;
-        const d_bytes = snap.counters.bytes -| self.prev_bytes;
-        const cur_errors = snap.counters.status_errors + snap.counters.socketErrors() + snap.counters.deadline_errors;
-        const d_errors = cur_errors -| self.prev_errors;
+        const d_completed = c.completed -| p.completed;
+        const d_bytes = c.bytes -| p.bytes;
+        // Per-kind, so a consumer can plot *how* a window failed — a tail that
+        // broke into deadline misses is a different story from one that broke
+        // into connect errors, and the scalar `errors` cannot tell them apart.
+        const d_connect = c.connect_errors -| p.connect_errors;
+        const d_read = c.read_errors -| p.read_errors;
+        const d_write = c.write_errors -| p.write_errors;
+        const d_timeout = c.timeouts -| p.timeouts;
+        const d_deadline = c.deadline_errors -| p.deadline_errors;
+        const d_status = c.status_errors -| p.status_errors;
+        const d_failures = d_connect + d_read + d_write + d_timeout + d_deadline;
+        const d_errors = d_failures + d_status;
         const achieved: f64 = if (interval_s > 0) @as(f64, @floatFromInt(d_completed)) / interval_s else 0;
         const bps: f64 = if (interval_s > 0) @as(f64, @floatFromInt(d_bytes)) / interval_s else 0;
 
+        // `error_rate` is this window's failure fraction, computed exactly like
+        // the summary's — so a row is directly comparable to the final number
+        // and to the `--max-error-rate` gate, and stays on one 0..1 axis no
+        // matter what `--interval` is set to (the raw `errors` count does not).
         try self.w.print(
-            "{{\"t\":{d:.3},\"target_rate\":{d:.1},\"achieved_rate\":{d:.1},\"requests\":{d},\"errors\":{d}," ++
-                "\"bytes\":{d},\"bytes_per_sec\":{d:.1}," ++
+            "{{\"t\":{d:.3},\"target_rate\":{d:.1},\"achieved_rate\":{d:.1},\"requests\":{d}," ++
+                "\"errors\":{d},\"error_rate\":{d:.6},",
+            .{
+                elapsed_s, if (self.cfg.closed) achieved else self.targetRate(elapsed_s),
+                achieved,  d_completed,
+                d_errors,  failureFraction(d_completed, d_status, d_failures),
+            },
+        );
+        try self.w.print(
+            "\"errors_by_kind\":{{\"connect\":{d},\"read\":{d},\"write\":{d}," ++
+                "\"timeout\":{d},\"deadline\":{d},\"non_2xx_3xx\":{d}}},",
+            .{ d_connect, d_read, d_write, d_timeout, d_deadline, d_status },
+        );
+        // The backlog gauge, in the row so it can be read against the same time
+        // axis as the latency it explains. Unlike every other count here it is
+        // *cumulative*: `max_behind_ns` is a running peak that is aggregated by
+        // max, not summed, so there is nothing to difference — an interval-local
+        // peak would need the connections to reset the gauge on the row cadence,
+        // which would cost the final report its true peak. Read the series as a
+        // staircase: each riser marks the window in which the fleet fell further
+        // behind its schedule than it ever had before.
+        try self.w.print(
+            "\"bytes\":{d},\"bytes_per_sec\":{d:.1},\"max_schedule_lag_us\":{d}," ++
                 "\"latency_us\":{{\"p50\":{d},\"p90\":{d},\"p99\":{d},\"p99_9\":{d},\"max\":{d}}}",
             .{
-                elapsed_s,                 if (self.cfg.closed) achieved else self.targetRate(elapsed_s),
-                achieved,                  d_completed,
-                d_errors,                  d_bytes,
-                bps,                       h.valueAtPercentile(50),
-                h.valueAtPercentile(90),   h.valueAtPercentile(99),
-                h.valueAtPercentile(99.9), h.max(),
+                d_bytes,                              bps,
+                c.max_behind_ns / std.time.ns_per_us, h.valueAtPercentile(50),
+                h.valueAtPercentile(90),              h.valueAtPercentile(99),
+                h.valueAtPercentile(99.9),            h.max(),
             },
         );
 
@@ -242,9 +286,7 @@ pub const TimeSeries = struct {
         try self.w.flush();
 
         snap.hist.copyInto(&self.prev_cum);
-        self.prev_completed = snap.counters.completed;
-        self.prev_bytes = snap.counters.bytes;
-        self.prev_errors = cur_errors;
+        self.prev_counters = c;
         self.prev_elapsed_s = elapsed_s;
     }
 };
@@ -395,6 +437,84 @@ test "time series row carries the interval HDR blob when enabled" {
     var decoded = try hdr.decodeBase64(testing.allocator, out[start..end]);
     defer decoded.deinit();
     try testing.expectEqual(@as(u64, 50), decoded.count());
+}
+
+test "time series rows break errors out by kind, as interval deltas" {
+    const cfg = testConfig();
+    var alloc = Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    var ts = try TimeSeries.init(testing.allocator, &alloc.writer, &cfg);
+    defer ts.deinit();
+
+    var snap: stats.Snapshot = .{
+        .hist = try stats.newHistogram(testing.allocator),
+        .counters = .{},
+    };
+    defer snap.deinit();
+
+    // First window: two deadline misses and a 500.
+    snap.hist.record(1000);
+    snap.counters.completed = 1;
+    snap.counters.recordStatus(500);
+    snap.counters.deadline_errors = 2;
+    snap.counters.max_behind_ns = 5_000; // 5ms peak so far
+    try ts.record(&snap, 1.0);
+
+    // Second window, against the same *cumulative* counters: one more deadline
+    // miss, one timeout, no new 500 — so the row must show 1/1/0, not 3/1/1.
+    snap.hist.record(2000);
+    snap.counters.completed = 2;
+    snap.counters.deadline_errors = 3;
+    snap.counters.timeouts = 1;
+    snap.counters.max_behind_ns = 40_000; // the peak stepped up to 40ms
+    try ts.record(&snap, 2.0);
+
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, alloc.written(), "\n"), '\n');
+    const first = it.next().?;
+    const second = it.next().?;
+    try testing.expect(it.next() == null);
+
+    try testing.expect(std.mem.indexOf(u8, first, "\"errors\":3,") != null);
+    // 1 completed + 2 deadline misses = 3 attempts, all 3 outcomes errors
+    // (the 500 plus the two misses): the same arithmetic the summary uses.
+    try testing.expect(std.mem.indexOf(u8, first, "\"error_rate\":1.000000,") != null);
+    try testing.expect(std.mem.indexOf(u8, first, "\"deadline\":2,\"non_2xx_3xx\":1}") != null);
+    try testing.expect(std.mem.indexOf(u8, first, "\"max_schedule_lag_us\":5,") != null);
+
+    try testing.expect(std.mem.indexOf(u8, second, "\"errors\":2,") != null);
+    // Second window: 1 completed + 1 deadline + 1 timeout = 3 attempts, 2 errors.
+    try testing.expect(std.mem.indexOf(u8, second, "\"error_rate\":0.666667,") != null);
+    try testing.expect(std.mem.indexOf(u8, second, "\"timeout\":1,\"deadline\":1,\"non_2xx_3xx\":0}") != null);
+    try testing.expect(std.mem.indexOf(u8, second, "\"connect\":0,\"read\":0,\"write\":0,") != null);
+    // The lag gauge is a running peak, not a per-interval delta: it carries the
+    // new high water mark rather than the 35ms difference.
+    try testing.expect(std.mem.indexOf(u8, second, "\"max_schedule_lag_us\":40,") != null);
+}
+
+test "row error_rate agrees with the summary's over a single window" {
+    const cfg = testConfig();
+    var alloc = Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    var ts = try TimeSeries.init(testing.allocator, &alloc.writer, &cfg);
+    defer ts.deinit();
+
+    var snap: stats.Snapshot = .{
+        .hist = try stats.newHistogram(testing.allocator),
+        .counters = .{},
+    };
+    defer snap.deinit();
+    snap.hist.record(1000);
+    snap.counters.completed = 97;
+    snap.counters.recordStatus(500); // one non-2xx/3xx
+    snap.counters.timeouts = 2;
+    snap.counters.deadline_errors = 1;
+
+    // Over one interval the row's delta *is* the cumulative total, so the row's
+    // rate must be the number the final summary would report.
+    try ts.record(&snap, 1.0);
+    var buf: [32]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&buf, "\"error_rate\":{d:.6},", .{errorRate(snap.counters)});
+    try testing.expect(std.mem.indexOf(u8, alloc.written(), expected) != null);
 }
 
 test "time series omits the HDR blob by default" {

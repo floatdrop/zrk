@@ -116,6 +116,7 @@ pub const Config = struct {
     hdr_path: ?[]const u8 = null,
     /// If set, stream one NDJSON object per `--interval` with that window's
     /// throughput and latency percentiles (a time series, ideal for ramps).
+    /// `"-"` streams to stdout instead of a file — see `timeseriesOnStdout`.
     timeseries_path: ?[]const u8 = null,
     /// Augment each `--timeseries` row with that interval's full latency
     /// distribution as an HdrHistogram V2 base64 blob (lossless, mergeable).
@@ -132,6 +133,15 @@ pub const Config = struct {
     max_error_rate: ?f64 = null,
 
     url: Url = undefined,
+
+    /// True when `--timeseries -` handed stdout to the NDJSON stream, so it can
+    /// be piped straight into a live plotter. stdout then belongs to the rows:
+    /// the live dashboard is suppressed and the final report goes to `--output`
+    /// if set, else stderr — otherwise the two would interleave on one stream.
+    pub fn timeseriesOnStdout(self: *const Config) bool {
+        const path = self.timeseries_path orelse return false;
+        return std.mem.eql(u8, path, "-");
+    }
 };
 
 pub const ParseError = error{
@@ -218,7 +228,10 @@ pub const usage =
     \\      --hdr         <FILE>  Also write the HdrHistogram percentile
     \\                            distribution (.hgrm) to FILE
     \\      --timeseries  <FILE>  Stream per-interval NDJSON (throughput +
-    \\                            latency percentiles) to FILE
+    \\                            latency percentiles) to FILE. "-" streams to
+    \\                            stdout for piping into a live plotter; the
+    \\                            dashboard is then suppressed and the final
+    \\                            report goes to stderr unless -o is given
     \\      --timeseries-histogram  Add each interval's full latency histogram
     \\                            (HdrHistogram base64) to every --timeseries row
     \\      --no-record-timeouts  Drop wire-timed-out requests from the latency
@@ -778,6 +791,23 @@ test "rate parses scalar and ramp forms" {
     try testing.expectEqual(@as(u64, 100), attached.rate);
     try testing.expectEqual(@as(?u64, 5000), attached.rate_end);
     try testing.expectError(error.ZeroRate, parse(a, &[_][]const u8{ "-R", "100:0", "http://x/" }));
+}
+
+test "--timeseries - claims stdout for the row stream" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const stdout = (try parse(a, &[_][]const u8{ "--timeseries", "-", "http://x/" })).config;
+    try testing.expectEqualStrings("-", stdout.timeseries_path.?);
+    try testing.expect(stdout.timeseriesOnStdout());
+
+    const to_file = (try parse(a, &[_][]const u8{ "--timeseries", "run.ndjson", "http://x/" })).config;
+    try testing.expect(!to_file.timeseriesOnStdout());
+
+    // No --timeseries at all: stdout stays the report's.
+    const none = (try parse(a, &[_][]const u8{"http://x/"})).config;
+    try testing.expect(!none.timeseriesOnStdout());
 }
 
 test "the README's usage block is the real help text" {

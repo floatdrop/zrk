@@ -137,7 +137,10 @@ pub const Dashboard = struct {
     pub fn init(io: Io, cfg: *const cli.Config, environ: std.process.Environ, buffer: []u8) Dashboard {
         const file = Io.File.stdout();
         const is_tty = file.isTty(io) catch false;
-        const tui_on = is_tty and !cfg.plain;
+        // `--timeseries -` hands stdout to the NDJSON rows: the panel cannot own
+        // a terminal it is not the one writing to, and its colors would be ANSI
+        // noise in whatever the summary is redirected to.
+        const tui_on = is_tty and !cfg.plain and !cfg.timeseriesOnStdout();
         return .{
             .io = io,
             .cfg = cfg,
