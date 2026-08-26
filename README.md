@@ -451,14 +451,3 @@ const report = try zrk.runner.run(arena.allocator(), io, &cfg, 0, null, null);
 | `src/tui.zig` | Live dashboard and final report. |
 | `src/main.zig` | Orchestration: resolve, launch connections, drive the dashboard. |
 
-## Limitations (v1)
-
-- HTTP/1.1 only; a single fixed request per run (no scripting).
-- `--timeout` bounds the **wire attempt** from the actual send (a response that
-  doesn't arrive in time is abandoned and counted as `Socket errors: ... timeout
-  N`, matching wrk2). It does **not** bound coordinated-omission latency under
-  overload — use `--deadline` for that (see "`--timeout` vs `--deadline`"
-  above). The *connect* itself still uses the OS default, since
-  connect-with-timeout is unimplemented in the std backend and panics.
-- `-k` skips certificate verification; with the std TLS client this also omits
-  SNI, so name-based virtual hosts may respond differently under `-k`.
