@@ -1,5 +1,5 @@
 <p align="center">
-    <img alt="zrk console demo" src="./zrk.gif" width="600" />
+    <img alt="zrk ramping load from 400 to 3400 req/s against a saturating service" src="./zrk.svg" width="880" />
 </p>
 
 # zrk
