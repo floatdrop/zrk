@@ -56,23 +56,33 @@ pub fn main(init: std.process.Init) !void {
 
     // Optional per-interval NDJSON time series. The File.Writer is a pinned
     // local (TimeSeries only borrows a *Io.Writer) so nothing dangles on a move.
+    //
+    // `--timeseries -` streams the rows to stdout so they can be piped into a
+    // live plotter; stdout is then the series' and not the report's, so the
+    // dashboard is suppressed below and the summary goes elsewhere.
+    const ts_stdout = cfg.timeseriesOnStdout();
     var ts_buf: [4096]u8 = undefined;
     var ts_file: Io.File = undefined;
     var ts_fw: Io.File.Writer = undefined;
     var ts_obj: report.TimeSeries = undefined;
     var ts_ptr: ?*report.TimeSeries = null;
     if (cfg.timeseries_path) |path| {
-        ts_file = try Io.Dir.cwd().createFile(io, path, .{});
-        ts_fw = .init(ts_file, io, &ts_buf);
+        ts_file = if (ts_stdout) .stdout() else try Io.Dir.cwd().createFile(io, path, .{});
+        // A created file is ours from offset 0, so positional writes are fine.
+        // stdout is not: it is a shared stream whose offset other writers (and
+        // the shell's `>>`) advance, and pwriting it from 0 would overwrite
+        // whatever is already there -- see the note on `writeAll`.
+        ts_fw = if (ts_stdout) .initStreaming(ts_file, io, &ts_buf) else .init(ts_file, io, &ts_buf);
         ts_obj = try report.TimeSeries.init(arena, &ts_fw.interface, &cfg);
         ts_ptr = &ts_obj;
     }
     defer if (cfg.timeseries_path != null) {
         ts_obj.deinit();
-        ts_file.close(io);
+        // stdout is the process', not ours to close.
+        if (!ts_stdout) ts_file.close(io);
     };
 
-    var progress: Progress = .{ .io = io, .dash = if (json) null else &dash, .ts = ts_ptr };
+    var progress: Progress = .{ .io = io, .dash = if (json or ts_stdout) null else &dash, .ts = ts_ptr };
     const active = progress.dash != null or progress.ts != null;
     const ctx: ?*anyopaque = if (active) @ptrCast(&progress) else null;
     const cb: ?runner.ProgressFn = if (active) onProgress else null;
@@ -105,9 +115,13 @@ pub fn main(init: std.process.Init) !void {
     if (json) {
         try writeJsonReport(arena, io, &cfg, &snapshot, result.elapsed_s, result.launched, result.interrupted);
     } else if (cfg.output_path) |path| {
-        // Text report redirected to --output; leave a breadcrumb on stdout.
+        // Text report redirected to --output; leave a breadcrumb on stdout —
+        // unless the time series owns stdout, where a breadcrumb would land
+        // mid-stream as a line no NDJSON reader can parse.
         try writeTextReport(io, &dash, path, &snapshot, result.elapsed_s);
-        try dash.finalRedirected(path);
+        if (!ts_stdout) try dash.finalRedirected(path);
+    } else if (ts_stdout) {
+        try writeSummaryToStderr(io, &dash, &snapshot, result.elapsed_s);
     } else {
         try dash.final(&snapshot, result.elapsed_s);
     }
@@ -198,14 +212,36 @@ fn writeTextReport(io: Io, dash: *tui.Dashboard, path: []const u8, snap: *const 
     try fw.interface.flush();
 }
 
-/// Write the JSON summary to `--output` (or stdout when unset).
+/// Write the JSON summary to `--output` (or stdout when unset; stderr when
+/// `--timeseries -` has claimed stdout for the row stream).
 fn writeJsonReport(gpa: std.mem.Allocator, io: Io, cfg: *const cli.Config, snap: *const stats.Snapshot, elapsed_s: f64, launched: u32, interrupted: bool) !void {
     var close = false;
-    const file = try openOut(io, cfg.output_path, &close);
+    const fallback: Io.File = if (cfg.timeseriesOnStdout()) .stderr() else .stdout();
+    const file = try openOut(io, cfg.output_path, fallback, &close);
     defer if (close) file.close(io);
     var buf: [8192]u8 = undefined;
-    var fw: Io.File.Writer = .init(file, io, &buf);
+    // Only a freshly created --output file can be written positionally; the
+    // stdout/stderr fallback is a shared stream that earlier writes (an SLO
+    // breach notice, a sink warning) have already advanced, and pwriting it
+    // from byte 0 corrupts the summary rather than following them.
+    var fw: Io.File.Writer = if (cfg.output_path != null)
+        .init(file, io, &buf)
+    else
+        .initStreaming(file, io, &buf);
     try report.writeJson(gpa, &fw.interface, cfg, snap, elapsed_s, launched, interrupted);
+    try fw.interface.flush();
+}
+
+/// Write the compact text summary to stderr. Used when `--timeseries -` owns
+/// stdout and no `--output` was given: the run still has to report itself
+/// somewhere, and stderr is the stream a plotting pipe leaves free.
+fn writeSummaryToStderr(io: Io, dash: *tui.Dashboard, snap: *const stats.Snapshot, elapsed_s: f64) !void {
+    var buf: [8192]u8 = undefined;
+    // Streaming, not positional: stderr is shared with the interrupt notice, the
+    // sink warnings and the SLO breach message, and a pwrite from byte 0 would
+    // interleave with them instead of following them (see `writeAll`).
+    var fw: Io.File.Writer = .initStreaming(.stderr(), io, &buf);
+    try dash.writeFinalSummary(&fw.interface, snap, elapsed_s);
     try fw.interface.flush();
 }
 
@@ -220,13 +256,13 @@ fn writeHdrFile(io: Io, path: []const u8, h: *const hdr.Histogram) !void {
     try fw.interface.flush();
 }
 
-fn openOut(io: Io, path: ?[]const u8, close: *bool) !Io.File {
+fn openOut(io: Io, path: ?[]const u8, fallback: Io.File, close: *bool) !Io.File {
     if (path) |p| {
         close.* = true;
         return Io.Dir.cwd().createFile(io, p, .{});
     }
     close.* = false;
-    return Io.File.stdout();
+    return fallback;
 }
 
 /// Upper bound on a request body read from a file/stdin, so a wrong path can't
