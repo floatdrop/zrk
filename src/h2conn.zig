@@ -17,7 +17,7 @@
 //! ## What it does not do
 //!
 //! No ALPN and no TLS — prior-knowledge h2c only, which is what makes this
-//! slice free of the ztls/libcrypto decision. No server push: we advertise
+//! slice free of the zssl/libcrypto decision. No server push: we advertise
 //! `SETTINGS_ENABLE_PUSH = 0`, and a peer that sends `PUSH_PROMISE` anyway is a
 //! protocol error rather than something to handle. No priority: RFC 9113
 //! deprecates the scheme and a load generator has nothing to say about it.

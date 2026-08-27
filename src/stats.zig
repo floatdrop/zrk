@@ -75,6 +75,10 @@ pub const Fleet = struct {
         errdefer allocator.free(params);
         const tls_state: ?[]tlsmod.State = if (enable_tls) try allocator.alloc(tlsmod.State, n) else null;
         errdefer if (tls_state) |ts| allocator.free(ts);
+        // The block arrives undefined and `State` reads its own fields to
+        // decide whether a previous session needs tearing down, so nothing may
+        // touch one before this runs.
+        if (tls_state) |ts| for (ts) |*state| state.init();
 
         var live_inited: usize = 0;
         errdefer for (live_hist[0..live_inited]) |*h| h.deinit();
@@ -160,7 +164,12 @@ pub const Fleet = struct {
         self.allocator.free(self.snap_hist);
         self.allocator.free(self.publish);
         self.allocator.free(self.params);
-        if (self.tls_state) |ts| self.allocator.free(ts);
+        // Each session holds libcrypto objects; freeing the block without
+        // this leaks one set per connection that ever handshook.
+        if (self.tls_state) |ts| {
+            for (ts) |*state| state.deinit();
+            self.allocator.free(ts);
+        }
     }
 };
 

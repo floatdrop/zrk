@@ -23,7 +23,7 @@
 | `src/runner.zig` | The reusable run loop the CLI and library embedders both call. |
 | `src/connection.zig` | The per-connection pacing loop (the coordinated-omission core). |
 | `src/pace.zig` | Closed-form nanosecond send schedule per connection and send index. |
-| `src/tls.zig` | TLS session setup over a stream (system CA bundle, `-k`). |
+| `src/tls.zig` | TLS over a stream: the `std.Io` adapter over [zssl](https://github.com/zoxy-io/zssl)'s sans-I/O engine, plus the X.509 chain and hostname verification zssl leaves to its embedder (system CA bundle, `-k`). |
 | `src/stats.zig` | Per-connection state ownership + snapshot/final aggregation. |
 | `src/report.zig` | Machine-readable JSON summary + SLO/CI exit-code gates. |
 | `src/tui.zig` | Live dashboard and final report. |

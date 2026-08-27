@@ -55,44 +55,33 @@
             .url = "git+https://github.com/zoxy-io/zurl#4ecb1768985425d4f09b317f23f203983ef87d96",
             .hash = "zurl-0.0.0--VALCi1dBQA6i4gkVVX11IV13I784dueJYYAzyZZTBPz",
         },
-        // libcrypto for ztls, built by Zig rather than found on the system.
+        // TLS 1.3, and the libcrypto under it.
         //
-        // ztls declares `linkSystemLibrary("crypto")`, which pkg-config would
-        // normally satisfy — but pkg-config only works when the host is the
-        // target, which is why zoxy builds natively on one runner per target
-        // and lost cross-compilation when it gained this dependency. A Zig-built
-        // libcrypto linked as an artifact keeps zrk's single-runner
-        // cross-compile.
+        // zssl replaces the ztls fork plus the separate `openssl` pin this
+        // manifest used to carry. Both of those are gone from here, and the
+        // build.zig plumbing that went with them — the `libcrypto.a` alias
+        // written so ztls's `linkSystemLibrary("crypto")` could find an
+        // archive by that name, the include path pushed onto ztls's module,
+        // the `crypto-pkg-config` opt-out that stopped a system OpenSSL's
+        // headers from colliding with ours. zssl links its own libcrypto into
+        // the module it exports, so a consumer imports one module and is done,
+        // and cross-compilation keeps working because nothing is resolved from
+        // the host.
         //
-        // OpenSSL rather than BoringSSL, and the same pin zoxy uses, so the two
-        // programs terminate and originate TLS on the same primitives. The
-        // BoringSSL family has no `CRYPTO_set_mem_functions`, which zoxy's fixed
-        // libcrypto heap cannot start without — so a shared pin had to be this
-        // one. zrk itself does not install allocation hooks; it changes here to
-        // stop the two from drifting.
+        // zssl is sans-I/O: it owns no socket, no allocator and no entropy.
+        // What that buys is that the protocol state machine — where TLS CVEs
+        // live — is auditable Zig, with libcrypto reduced to the constant-time
+        // primitives. What it costs is that `src/tls.zig` is no longer a thin
+        // wrapper: the `std.Io` adapter and the X.509 chain and hostname
+        // verification are zrk's now, because zssl deliberately declines both.
+        // That trade is the whole point of the swap; see src/tls.zig.
         //
-        // The fork carries allyourcodebase/openssl#5 (pre-generated perlasm for
-        // aarch64, which upstream has only for x86_64) on top of a 3.5.7 bump:
-        // the LTS line, supported to 2030. Verified building for all four
-        // release targets.
-        .openssl = .{
-            .url = "git+https://github.com/zoxy-io/openssl?ref=openssl-3.5.7#546ec9845fa43013021609a8590e03678cc0fb20",
-            .hash = "openssl-3.5.7-TC9C3eDHfwHNGqKQk63LrMZg6g-YSvctDN8wNP1uktMX",
-        },
-        // TLS 1.3, for ALPN and therefore for HTTP/2 over TLS (#21).
-        //
-        // Pinned to `zoxy-tls`, the line zoxy audits and pins rather than
-        // `main`, so both consumers are on the same audited snapshot. It
-        // carries zoxy-io/ztls#2, which exposes the `std.Io` integration as a
-        // module — without it that adapter is a subdirectory no `zig fetch` can
-        // reach, and zrk's only options were vendoring 1177 lines of it or
-        // writing a second one.
-        //
-        // ztls is Linux and macOS only by design; the Windows release targets
-        // were dropped for it in 5a36623.
-        .ztls = .{
-            .url = "git+https://github.com/zoxy-io/ztls?ref=zoxy-tls#03c246477370d83bfc38d5168250e10fb235f358",
-            .hash = "ztls-0.0.0-SHHDXrvzFgAxDlPTWEEam3B2YclV_S0hHpOrD3qGFnEp",
+        // A path dependency, not a URL: zssl is developed alongside zrk in the
+        // same tree, and the client-origination work this depends on (RSA-PSS
+        // leaves, the chain seam, ALPN lists) is what makes zrk able to point
+        // at arbitrary HTTPS endpoints at all.
+        .zssl = .{
+            .path = "../zssl",
         },
     },
     .paths = .{

@@ -537,9 +537,10 @@ fn performWork(
 ) WorkResult {
     if (session) |active| return performWorkHttp2(p, active);
     app_writer.writeAll(p.request) catch return .write_failed;
-    // One flush is enough: ztls-std's writer encrypts *and* writes the records
-    // to the socket handle itself, where `std.crypto.tls` only encrypted into
-    // the socket writer's buffer and needed a second flush behind it.
+    // One flush is enough: the TLS writer in `tls.zig` seals *and* writes the
+    // records to the socket handle itself, where `std.crypto.tls` only
+    // encrypted into the socket writer's buffer and needed a second flush
+    // behind it.
     app_writer.flush() catch return .write_failed;
     const resp = httpmod.parseResponse(app_reader, p.method) catch return .read_failed;
     return .{ .ok = resp };

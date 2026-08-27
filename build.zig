@@ -72,80 +72,31 @@ pub fn build(b: *std.Build) void {
     build_info.addOption([]const u8, "version", manifest.version);
     const build_info_mod = build_info.createModule();
 
-    // TLS, and the libcrypto under it.
+    // TLS 1.3, and the libcrypto under it.
     //
-    // On a native build pkg-config supplies the search path, the include path
-    // and the archive invisibly through `linkSystemLibrary("crypto")`. A
-    // cross-build has no pkg-config, so each becomes explicit:
+    // One dependency, one module. zssl links its own Zig-built libcrypto into
+    // the module it exports, so everything the ztls pin needed here is gone:
+    // the `libcrypto.a` alias written so `linkSystemLibrary("crypto")` could
+    // find an archive by that name, the search path pointed at it, the include
+    // path pushed onto ztls's module, and the `crypto-pkg-config` opt-out that
+    // kept a system OpenSSL's headers from colliding with ours on machines
+    // where pkg-config knew about it. Cross-compilation still works for the
+    // same reason it did before — nothing is resolved from the host — but it
+    // is now zssl's build that says so.
     //
-    //   1. a library search path, so ztls's `linkSystemLibrary("crypto")`
-    //      finds an archive by that name at all — see the alias below;
-    //   2. an include path on **ztls's own module**, because include paths are
-    //      per-module and the `@cImport` of `openssl/crypto.h` lives there,
-    //      not here. `linkLibrary` carries the package's installed headers, so
-    //      linking the artifact into that module covers both.
-    const openssl = b.dependency("openssl", .{
+    // `sanitize_c = .off` for the vendored C moved there with it, which is
+    // where it belongs: it is a property of building OpenSSL, not of building
+    // zrk. See zssl's build.zig, and zoxy-io/zoxy#283 for what shipped without
+    // it.
+    const zssl = b.dependency("zssl", .{
         .target = target,
         .optimize = optimize,
     });
-    const libcrypto = openssl.artifact("openssl");
-    // Hung off each runnable artifact below rather than off libcrypto itself,
+    const zssl_module = zssl.module("zssl");
+
+    // Hung off each runnable artifact below rather than off the dependency,
     // so `zig build check` keeps working without a C toolchain.
     const libc_guard = nativeLibcGuard(b, target);
-    // Zig's C sanitizers off for the vendored C, in every mode. `sanitize_c`
-    // defaults to `.full` in Debug and `.trap` in ReleaseSafe, and only the
-    // `.full` arm passes `-fno-sanitize=function` (Zig's src/Compilation.zig),
-    // whose comment there calls the pattern it flags "very common, and
-    // well-defined"; `lib/zig/ubsan_rt.zig` leaves the matching handler
-    // commented out for the same reason. So the one check Zig deliberately
-    // disables is armed only in ReleaseSafe, as a `ud1` trap, and
-    // `OPENSSL_sk_pop_free` calling its `free_func` through a cast pointer is
-    // the first one a TLS run reaches — 12039 traps in the binary, 2401 of
-    // them that check, and `-Doptimize=ReleaseSafe` dies in
-    // `privateKeyFromSecret` generating the client's ephemeral key before a
-    // single request goes out.
-    //
-    // Preventive rather than a bug fix: every build this project ships is
-    // ReleaseFast (ci.yml, release.yml), where `sanitize_c` is already `.off`,
-    // and nothing in CI builds ReleaseSafe to notice otherwise. Not
-    // theoretical, though — this line missing is what shipped zoxy v0.6.0 with
-    // TLS that could not start (zoxy-io/zoxy#283). Set explicitly so the
-    // answer is a decision here rather than a consequence of an optimize flag.
-    libcrypto.root_module.sanitize_c = .off;
-
-    // ztls asks the linker for `-lcrypto` by name, and this package emits
-    // `libopenssl.a`. Linking the artifact resolves every symbol, but the
-    // linker still has to *find* a file called `libcrypto.a` or it fails
-    // before it gets that far — so publish one under that name and point the
-    // search path at it. A copy, not a rename of the artifact, because the
-    // artifact's name is the package's API and other consumers use it.
-    const crypto_alias = b.addWriteFiles();
-    _ = crypto_alias.addCopyFile(libcrypto.getEmittedBin(), "libcrypto.a");
-    const crypto_alias_dir = crypto_alias.getDirectory();
-
-    const ztls_dep = b.dependency("ztls", .{
-        .target = target,
-        .optimize = optimize,
-        // We supply libcrypto, so pkg-config must not. Left on, it injects the
-        // system OpenSSL's include path ahead of ours, and the C import dies
-        // on typedef collisions — but only on machines where pkg-config knows
-        // about OpenSSL, so it passes CI and breaks on a laptop.
-        .@"crypto-pkg-config" = false,
-    });
-    const ztls_core = ztls_dep.module("ztls");
-    ztls_core.linkLibrary(libcrypto);
-    const ztls_std = ztls_dep.module("ztls_std");
-
-    // Every artifact that reaches `src/tls.zig` needs the archive and the
-    // search path; they always travel together, so they are set in one place
-    // rather than repeated per artifact.
-    const linkCrypto = struct {
-        fn apply(module: *std.Build.Module, lib: *std.Build.Step.Compile, alias_dir: std.Build.LazyPath) void {
-            module.addLibraryPath(alias_dir);
-            module.linkLibrary(lib);
-            module.link_libc = true;
-        }
-    }.apply;
 
     // The reusable library module: embedders `@import("zrk")` this.
     const mod = b.addModule("zrk", .{
@@ -156,10 +107,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zio", .module = zio.module("zio") },
             .{ .name = "h2", .module = h2.module("h2") },
             .{ .name = "zurl", .module = zurl.module("zurl") },
-            .{ .name = "ztls_std", .module = ztls_std },
+            .{ .name = "zssl", .module = zssl_module },
         },
     });
-    linkCrypto(mod, libcrypto, crypto_alias_dir);
     // `cli.zig` checks the README's usage block against the real help text.
     // `@embedFile` cannot escape the module root, so the file arrives as a named
     // import instead.
@@ -194,11 +144,10 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zio", .module = zio.module("zio") },
                 .{ .name = "h2", .module = h2.module("h2") },
                 .{ .name = "zurl", .module = zurl.module("zurl") },
-                .{ .name = "ztls_std", .module = ztls_std },
+                .{ .name = "zssl", .module = zssl_module },
             },
         }),
     });
-    linkCrypto(exe.root_module, libcrypto, crypto_alias_dir);
     exe.root_module.addAnonymousImport("readme", .{ .root_source_file = b.path("README.md") });
     if (libc_guard) |guard| exe.step.dependOn(guard);
     b.installArtifact(exe);
@@ -210,11 +159,11 @@ pub fn build(b: *std.Build) void {
     // and fails `zig build test` — which is exactly how the `readme` import
     // above reached CI.
     //
-    // `zig build` needs libcrypto, which means building BoringSSL — minutes,
-    // and impossible in a sandbox that cannot reach the two non-GitHub hosts
-    // its package pulls from. An object needs no libraries, so this answers
-    // "does the Zig compile" in seconds, which is the question most edits
-    // actually raise.
+    // `zig build` needs libcrypto, which means compiling OpenSSL from source —
+    // minutes, and impossible in a sandbox that cannot reach the hosts its
+    // package pulls from. An object needs no libraries, so this answers "does
+    // the Zig compile" in seconds, which is the question most edits actually
+    // raise.
     const check = b.addObject(.{
         .name = "zrk-check",
         .root_module = exe.root_module,

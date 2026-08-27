@@ -36,8 +36,8 @@ brew install zoxy-io/tap/zrk
 
 Download the latest release binary from the [Releases page](https://github.com/zoxy-io/zrk/releases).
 Linux and macOS, x86_64 and aarch64. Windows binaries were dropped after v1.4.3
-([#21](https://github.com/zoxy-io/zrk/issues/21)): zrk's TLS is moving to
-[ztls](https://github.com/zoxy-io/ztls), which is Linux/macOS by design.
+([#21](https://github.com/zoxy-io/zrk/issues/21)): zrk terminates TLS through
+[zssl](https://github.com/zoxy-io/zssl), which is Linux/macOS by design.
 
 ### Build from source
 
