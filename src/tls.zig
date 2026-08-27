@@ -28,18 +28,21 @@
 //! TLS is selected by it (RFC 9113 §3.2), and `std.crypto.tls` has none, so
 //! `--http2` could only ever have been cleartext. See zoxy-io/zrk#21.
 //!
-//! Nothing here imposes a timeout; a slow peer can stall a handshake or a read
-//! indefinitely, and the right mechanism is `std.Io` cancellation.
-//! `connection.zig` already owns that: `watchTimer` shuts the socket down, and
-//! the cancellation surfaces here as a transport error.
+//! Nothing here imposes a timeout; the right mechanism is `std.Io`
+//! cancellation, and when `connection.zig` arms it — around the HTTP/2
+//! preface, and through `Watchdog` once the transport is up — shutting the
+//! socket down surfaces here as a transport error.
+//!
+//! The handshake itself is *not* covered by either: a peer that completes the
+//! TCP connect and then never sends a ServerHello pins the connection's
+//! coroutine past the run's end. That gap predates this file's rewrite and is
+//! noted here rather than papered over.
 
 const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 const Certificate = std.crypto.Certificate;
 const zssl = @import("zssl");
-
-const assert = std.debug.assert;
 
 /// The system trust store, loaded once and shared by all connections.
 ///
@@ -141,9 +144,16 @@ pub const State = struct {
 
     /// Perform the TLS handshake over `stream`, offering `alpn`.
     ///
-    /// When `insecure` is true neither the hostname nor the chain is verified
-    /// (`-k`); zssl still proves the peer holds the key its leaf names unless
-    /// there is no chain to check it against.
+    /// When `insecure` is true (`-k`) the certificate is not looked at *at
+    /// all*: not the hostname, not the chain, and not the CertificateVerify
+    /// that would prove the peer holds the key its leaf names. The session is
+    /// encrypted and wholly unauthenticated.
+    ///
+    /// That is more permissive than curl's `-k`, which still checks
+    /// possession, and it is the deliberate choice for a benchmarking tool:
+    /// `-k` means "measure this endpoint whatever it presents", including
+    /// leaf key types zssl would otherwise refuse. It is not a weaker version
+    /// of verification, it is the absence of it.
     pub fn handshake(
         self: *State,
         io: Io,
@@ -193,7 +203,10 @@ pub const State = struct {
 
         try self.transportWrite(self.client.start(&self.out_read));
         while (self.client.state != .connected) {
-            const wire_record = try self.nextRecord();
+            const wire_record = self.nextRecord() catch |err| return switch (err) {
+                error.RecordFailed => error.HandshakeTooLarge,
+                error.PeerClosed, error.TransportFailed => error.TransportFailed,
+            };
             const event = self.client.handleRecord(wire_record, &self.out_read) catch |err|
                 return self.trust.classify(err);
             switch (event) {
@@ -228,21 +241,37 @@ pub const State = struct {
 
     // ── transport ────────────────────────────────────────────────────────
 
+    /// Why a record could not be produced. The three are kept apart because
+    /// the read path has to tell a *close* from a *failure*: collapsing them
+    /// reports a connection reset mid-body as a clean end of stream, and a
+    /// close-delimited HTTP response truncated by a reset then parses as a
+    /// complete one and is counted as a success.
+    const RecordError = error{
+        /// The peer stopped sending. A transport EOF, not a `close_notify`;
+        /// TLS calls that truncation, but enough servers close this way that
+        /// the caller is left to judge whether it landed at a legal point.
+        PeerClosed,
+        /// The socket failed, or the run's watchdog shut it down.
+        TransportFailed,
+        /// The bytes were not a record we could frame.
+        RecordFailed,
+    };
+
     /// Read straight into the record buffer's own writable region, so a
     /// record is staged once rather than copied through a second buffer.
-    fn fillRecords(self: *State) HandshakeError!void {
+    fn fillRecords(self: *State) RecordError!void {
         const room = self.records.writable();
         var data: [1][]u8 = .{room};
         const n = self.io.vtable.netRead(self.io.userdata, self.stream.socket.handle, &data) catch
             return error.TransportFailed;
-        if (n == 0) return error.TransportFailed;
+        if (n == 0) return error.PeerClosed;
         self.records.advance(n);
     }
 
     /// The next whole record off the wire.
-    fn nextRecord(self: *State) HandshakeError![]const u8 {
+    fn nextRecord(self: *State) RecordError![]const u8 {
         while (true) {
-            if (self.records.next() catch return error.HandshakeTooLarge) |wire_record| {
+            if (self.records.next() catch return error.RecordFailed) |wire_record| {
                 return wire_record;
             }
             try self.fillRecords();
@@ -275,10 +304,14 @@ pub const State = struct {
         while (true) {
             const wire_record = self.nextRecord() catch |err| {
                 self.read_closed = true;
-                // A transport EOF after a complete response is how many
-                // servers close; the caller distinguishes it by having
-                // already parsed one.
-                return if (err == error.TransportFailed) error.EndOfStream else error.Failed;
+                return switch (err) {
+                    // How most servers end a close-delimited response.
+                    error.PeerClosed => error.EndOfStream,
+                    // A reset, or the wire timeout shutting the socket down.
+                    // Reported as a failure so a body cut short is counted as
+                    // one instead of parsing as a complete response.
+                    error.TransportFailed, error.RecordFailed => error.Failed,
+                };
             };
             const event = self.client.handleRecord(wire_record, &self.out_read) catch {
                 self.read_closed = true;
@@ -307,6 +340,12 @@ pub const State = struct {
     /// Seal `bytes` into records and put them on the wire. TLS caps a record's
     /// plaintext at 16 KiB (§5.1), so anything longer becomes several.
     fn sendApplicationData(self: *State, bytes: []const u8) Io.Writer.Error!void {
+        // zssl asserts the session is connected, so writing after the peer
+        // closed would panic the process rather than fail the connection.
+        // `connection.zig` does not do that today — it drops the connection
+        // on any read failure — but that is a property of a caller in another
+        // file, and one missed reconnect should not take the fleet down.
+        if (self.read_closed or self.client.state != .connected) return error.WriteFailed;
         var rest = bytes;
         while (rest.len != 0) {
             const take = @min(rest.len, zssl.record.plaintext_bytes_max);
@@ -444,11 +483,142 @@ const Trust = struct {
     }
 };
 
+/// What a certificate is permitted to do as an issuer (RFC 5280 §4.2.1.9,
+/// §4.2.1.3), read back out of its DER.
+///
+/// `std.crypto.Certificate` parses these extensions' OIDs but keeps only the
+/// subject alternative name, and `Parsed.verify` checks issuer name, validity
+/// and signature and nothing else — so a chain walk built on it alone will
+/// happily let an end-entity certificate sign another certificate. That is
+/// the hole this closes.
+const IssuerCapability = struct {
+    is_ca: bool,
+    /// `pathLenConstraint`: how many non-self-issued intermediates may sit
+    /// between this certificate and the leaf. Null means unconstrained.
+    path_len: ?u8,
+    /// keyUsage is optional; absent means unconstrained (§4.2.1.3), present
+    /// means `keyCertSign` has to be among the bits.
+    permits_cert_sign: bool,
+};
+
+/// Re-walk `tbsCertificate` to the extensions block and read basicConstraints
+/// and keyUsage.
+///
+/// The walk is duplicated from `std.crypto.Certificate.parse` because `Parsed`
+/// does not retain the offset the extensions start at — it keeps slices, not
+/// the `subjectPublicKeyInfo` element that locates what follows it.
+fn issuerCapability(parsed: Certificate.Parsed) !IssuerCapability {
+    // A v1 or v2 certificate carries no extensions at all, so it asserts no
+    // cA bit and cannot be an issuer under this policy.
+    if (parsed.version == .v1) return .{ .is_ca = false, .path_len = null, .permits_cert_sign = false };
+
+    const der = Certificate.der;
+    const bytes = parsed.certificate.buffer;
+    const certificate = try der.Element.parse(bytes, parsed.certificate.index);
+    const tbs = try der.Element.parse(bytes, certificate.slice.start);
+    const version_elem = try der.Element.parse(bytes, tbs.slice.start);
+    // `[0] EXPLICIT version` is optional; when absent the first element is
+    // already the serial number.
+    const serial = if (@as(u8, @bitCast(version_elem.identifier)) == 0xa0)
+        try der.Element.parse(bytes, version_elem.slice.end)
+    else
+        version_elem;
+    const tbs_signature = try der.Element.parse(bytes, serial.slice.end);
+    const issuer = try der.Element.parse(bytes, tbs_signature.slice.end);
+    const validity = try der.Element.parse(bytes, issuer.slice.end);
+    const subject = try der.Element.parse(bytes, validity.slice.end);
+    const pub_key_info = try der.Element.parse(bytes, subject.slice.end);
+
+    var capability: IssuerCapability = .{
+        .is_ca = false,
+        .path_len = null,
+        // Absent keyUsage is unconstrained, so this starts true and is
+        // narrowed only if the extension actually appears.
+        .permits_cert_sign = true,
+    };
+    if (pub_key_info.slice.end >= tbs.slice.end) return capability;
+
+    // `[3] EXPLICIT extensions`. std matches the context tag number against
+    // `.bitstring` because both are 3; the same trick is used here so the two
+    // walks cannot disagree about where extensions begin.
+    const outer = try der.Element.parse(bytes, pub_key_info.slice.end);
+    if (outer.identifier.tag != .bitstring) return capability;
+    const extensions = try der.Element.parse(bytes, outer.slice.start);
+
+    var index = extensions.slice.start;
+    while (index < extensions.slice.end) {
+        const extension = try der.Element.parse(bytes, index);
+        index = extension.slice.end;
+        const oid = try der.Element.parse(bytes, extension.slice.start);
+        // The optional `critical` BOOLEAN sits between the OID and the value.
+        const after_oid = try der.Element.parse(bytes, oid.slice.end);
+        const value = if (after_oid.identifier.tag != .boolean)
+            after_oid
+        else
+            try der.Element.parse(bytes, after_oid.slice.end);
+        const oid_bytes = bytes[oid.slice.start..oid.slice.end];
+        if (std.mem.eql(u8, oid_bytes, &.{ 0x55, 0x1d, 0x13 })) {
+            try readBasicConstraints(bytes, value, &capability);
+        } else if (std.mem.eql(u8, oid_bytes, &.{ 0x55, 0x1d, 0x0f })) {
+            capability.permits_cert_sign = try readKeyCertSign(bytes, value);
+        }
+    }
+    return capability;
+}
+
+/// `BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
+/// pathLenConstraint INTEGER (0..MAX) OPTIONAL }`, inside the extension's
+/// OCTET STRING.
+fn readBasicConstraints(
+    bytes: []const u8,
+    value: Certificate.der.Element,
+    capability: *IssuerCapability,
+) !void {
+    const der = Certificate.der;
+    const sequence = try der.Element.parse(bytes, value.slice.start);
+    if (sequence.identifier.tag != .sequence) return error.CertificateFieldHasWrongDataType;
+    var index = sequence.slice.start;
+    if (index >= sequence.slice.end) return; // Both members defaulted/absent.
+    const first = try der.Element.parse(bytes, index);
+    var rest = first;
+    if (first.identifier.tag == .boolean) {
+        if (first.slice.end - first.slice.start != 1) return error.CertificateFieldHasInvalidLength;
+        // DER says TRUE is 0xff, but be liberal in what a nonzero byte means
+        // here: anything other than zero asserts the bit.
+        capability.is_ca = bytes[first.slice.start] != 0;
+        index = first.slice.end;
+        if (index >= sequence.slice.end) return;
+        rest = try der.Element.parse(bytes, index);
+    }
+    if (rest.identifier.tag == .integer) {
+        const length = rest.slice.end - rest.slice.start;
+        // A path length that does not fit in a byte is longer than any chain
+        // we would walk, so it constrains nothing.
+        if (length == 1) capability.path_len = bytes[rest.slice.start];
+    }
+}
+
+/// `KeyUsage ::= BIT STRING`, where `keyCertSign` is bit 5 counting from the
+/// most significant bit of the first data byte.
+fn readKeyCertSign(bytes: []const u8, value: Certificate.der.Element) !bool {
+    const der = Certificate.der;
+    const bit_string = try der.Element.parse(bytes, value.slice.start);
+    if (bit_string.identifier.tag != .bitstring) return error.CertificateFieldHasWrongDataType;
+    // The first content byte counts unused trailing bits; the flags follow.
+    if (bit_string.slice.end - bit_string.slice.start < 2) return false;
+    const flags = bytes[bit_string.slice.start + 1];
+    return flags & 0x04 != 0;
+}
+
 const VerifyError = error{
     CertificateHostMismatch,
     CertificateIssuerNotFound,
     CertificateMalformed,
     CertificateNotTrusted,
+    /// A certificate in the chain signed the one before it without being
+    /// allowed to sign anything: no `cA` bit, no `keyCertSign`, or a
+    /// `pathLenConstraint` shorter than the chain that followed it.
+    CertificateIssuerNotCa,
 };
 
 /// Walk the peer's chain from leaf to anchor, the way `std.crypto.tls.Client`
@@ -476,6 +646,21 @@ fn verifyChain(
             // so a peer cannot smuggle an unrelated trusted certificate into
             // the list to satisfy the anchor check below.
             previous.verify(subject, now_sec) catch return error.CertificateNotTrusted;
+            // And it must have been *allowed* to issue it. Without this, any
+            // holder of a publicly-trusted end-entity certificate can sign a
+            // certificate for any name and present
+            // [forged, their_leaf, real_intermediate]: every signature checks
+            // out and the walk reaches a real anchor. `Parsed.verify` does not
+            // look at basicConstraints, so the check has to be here.
+            const capability = issuerCapability(subject) catch return error.CertificateMalformed;
+            if (!capability.is_ca) return error.CertificateIssuerNotCa;
+            if (!capability.permits_cert_sign) return error.CertificateIssuerNotCa;
+            // `pathLenConstraint` counts the intermediates allowed between
+            // this certificate and the leaf, which is how many the peer put
+            // there: everything at a lower index except the leaf itself.
+            if (capability.path_len) |limit| {
+                if (index - 1 > limit) return error.CertificateIssuerNotCa;
+            }
         }
         if (bundle.verify(subject, now_sec)) {
             return;
@@ -514,6 +699,45 @@ fn testChain(storage: []u8, certificates: []const []const u8) zssl.certificate_l
         index += 2;
     }
     return .init(storage[0..index]);
+}
+
+/// A CA (`CA:TRUE`, `keyCertSign`) and a leaf it actually issued.
+const test_ca_der = @embedFile("testdata/ca.der");
+const test_ca_issued_leaf_der = @embedFile("testdata/ca-issued-leaf.der");
+
+/// The impersonation chain: an ordinary end-entity certificate
+/// (`CA:FALSE`) and a leaf for someone else's name that it signed.
+const test_attacker_leaf_der = @embedFile("testdata/attacker-leaf.der");
+const test_forged_leaf_der = @embedFile("testdata/forged-leaf.der");
+
+test "verifyChain refuses an end-entity certificate acting as a CA" {
+    // The attack this exists to stop: an adversary holding any leaf a real
+    // CA issued signs a certificate for someone else's name and presents
+    // [forged, their_leaf, real_intermediate, ...]. Every signature checks
+    // out and the walk reaches a genuine anchor, so name matching and
+    // link-signing alone accept it. `basicConstraints` is what does not.
+    var storage: [4096]u8 = undefined;
+    const chain = testChain(&storage, &.{ test_forged_leaf_der, test_attacker_leaf_der });
+    const empty: Certificate.Bundle = .empty;
+    try std.testing.expectError(
+        error.CertificateIssuerNotCa,
+        verifyChain(&empty, chain, "victim.zrk.test", std.testing.io),
+    );
+}
+
+test "verifyChain accepts a real CA as an issuer" {
+    // The other half of the pair: an issuer that does assert cA and
+    // keyCertSign passes the capability check and the walk continues,
+    // failing only because this bundle trusts nothing. Without this the
+    // test above would pass just as well against a check that refused
+    // every issuer.
+    var storage: [4096]u8 = undefined;
+    const chain = testChain(&storage, &.{ test_ca_issued_leaf_der, test_ca_der });
+    const empty: Certificate.Bundle = .empty;
+    try std.testing.expectError(
+        error.CertificateIssuerNotFound,
+        verifyChain(&empty, chain, "good.zrk.test", std.testing.io),
+    );
 }
 
 test "verifyChain checks the name on the leaf, before the anchor" {
