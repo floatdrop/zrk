@@ -76,12 +76,19 @@
         // verification are zrk's now, because zssl deliberately declines both.
         // That trade is the whole point of the swap; see src/tls.zig.
         //
-        // A path dependency, not a URL: zssl is developed alongside zrk in the
-        // same tree, and the client-origination work this depends on (RSA-PSS
-        // leaves, the chain seam, ALPN lists) is what makes zrk able to point
-        // at arbitrary HTTPS endpoints at all.
+        // Pinned by commit and content hash like every other dependency here,
+        // rather than by path to the sibling checkout it is developed in: CI
+        // checks out zrk alone, so a path would resolve on one machine and
+        // nowhere else. The pin also records which zssl a given zrk was built
+        // and tested against, which matters more than usual while the client
+        // half is young.
+        //
+        // This commit carries the client-origination work zrk depends on:
+        // RSA-PSS leaves, the `chain_verifier` seam, and ALPN offered as a
+        // list — together, what lets zrk point at arbitrary HTTPS endpoints.
         .zssl = .{
-            .path = "../zssl",
+            .url = "git+https://github.com/zoxy-io/zssl#992ee9d1de1694f1766fc67b3995b308883d7acf",
+            .hash = "zssl-0.0.1-5ocyiPiKBgDH51EtHsMwAgVqckTbQULx4VlaCxxDg5li",
         },
     },
     .paths = .{
