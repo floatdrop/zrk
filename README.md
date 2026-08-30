@@ -68,6 +68,11 @@ Options:
                             No coordinated-omission correction; the rate
                             finds its own ceiling instead of chasing one.
                             Incompatible with a ramp (-R A:B) or --deadline
+      --disable-keepalive   Close and reconnect after every response: one
+                            connection per request, like ab. Enforced
+                            client-side, so it also covers servers that
+                            ignore the Connection: close it sends.
+                            Not available with --http2
   -H, --header  <K: V>      Add a request header (repeatable)
   -m, --method      <M>     HTTP method                    (default GET)
   -b, --body     <S|@FILE>  Request body; @FILE reads it from a file

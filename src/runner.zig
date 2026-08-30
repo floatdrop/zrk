@@ -140,6 +140,7 @@ pub fn run(
         .deadline_ns = cfg.deadline_ns,
         .deadline_abort = cfg.deadline_abort,
         .record_timeouts = cfg.record_timeouts,
+        .disable_keepalive = cfg.disable_keepalive,
         .end = end,
         .stop = &stop,
         .allocator = arena,

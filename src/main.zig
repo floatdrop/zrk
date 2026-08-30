@@ -412,6 +412,7 @@ fn printUsageError(io: Io, err: cli.ParseError) !void {
         error.ZeroRefresh => "zrk: --refresh must be greater than 0\n\n",
         error.ClosedWithRamp => "zrk: --closed is incompatible with a ramp (-R A:B)\n\n",
         error.ClosedWithDeadline => "zrk: --closed is incompatible with --deadline\n\n",
+        error.KeepaliveWithHttp2 => "zrk: --disable-keepalive is incompatible with --http2\n\n",
         error.OutOfMemory => "zrk: out of memory\n\n",
     };
     try writeAll(io, .stderr(), msg);

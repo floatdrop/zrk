@@ -100,12 +100,13 @@ pub fn writeJson(
 
     try w.writeAll("  \"config\": {");
     try w.print(
-        " \"connections\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"closed\": {}, \"target_rate\": {d}, \"timeout_ms\": {d}, \"deadline_ms\": {d}, \"deadline_abort\": {}, \"record_timeouts\": {} }},\n",
+        " \"connections\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"closed\": {}, \"disable_keepalive\": {}, \"target_rate\": {d}, \"timeout_ms\": {d}, \"deadline_ms\": {d}, \"deadline_abort\": {}, \"record_timeouts\": {} }},\n",
         .{
             cfg.connections,
             launched,
             @as(f64, @floatFromInt(cfg.duration_ns)) / std.time.ns_per_s,
             cfg.closed,
+            cfg.disable_keepalive,
             cfg.rate,
             cfg.timeout_ns / std.time.ns_per_ms,
             cfg.deadline_ns / std.time.ns_per_ms,
