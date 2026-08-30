@@ -162,6 +162,11 @@ pub const Params = struct {
     /// times out on the wire, instead of dropping it (which would truncate the
     /// tail). Does not apply to `deadline` misses, which are never recorded.
     record_timeouts: bool = true,
+    /// Close the connection after every response and reconnect for the next
+    /// request (`--disable-keepalive`), regardless of what the response said
+    /// about reuse. See `cli.Config.disable_keepalive` for why the decision
+    /// cannot be left to the server.
+    disable_keepalive: bool = false,
     /// Monotonic timestamp at which the connection should stop sending.
     end: Io.Timestamp,
     /// Set to true (by the coordinator) to request an early graceful stop.
@@ -400,7 +405,15 @@ pub fn run(p: *Params) void {
                     // A timer may have fired in the same event batch as the
                     // response; the response still counts, but the socket is
                     // shut down so the connection is dead.
-                    if (timed_out or !resp.keep_alive) {
+                    //
+                    // `disable_keepalive` retires the connection here on our
+                    // own terms rather than the server's: a server that ignores
+                    // the `Connection: close` we sent would otherwise keep the
+                    // socket — and its keep-alive throughput — while a
+                    // compliant one paid for a connection per request, which
+                    // would make the two incomparable in the one mode whose
+                    // entire purpose is comparing them.
+                    if (timed_out or !resp.keep_alive or p.disable_keepalive) {
                         conn_open = false;
                     }
                 },
@@ -966,6 +979,75 @@ test "closed schedule sends as fast as the server answers, never behind" {
     // Every completed response is a recorded (round-trip, not CO-adjusted-
     // backward) latency sample, same invariant as the paced schedules above.
     try testing.expectEqual(counters.completed, histogram.count());
+}
+
+test "disable_keepalive retires the connection a keep-alive response would keep" {
+    // `serveConn` answers with no `Connection` header at all, which over
+    // HTTP/1.1 means keep-alive (zurl's parser defaults `keep_alive` to
+    // `version == .@"1.1"`). It is therefore the exact case `-H 'Connection:
+    // close'` cannot reach: a server that will happily go on reusing the
+    // socket no matter what the request asked for. The flag has to win anyway,
+    // or it does nothing for precisely the servers it was added to measure.
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    // One accepted connection for the whole test, as in the sibling tests: so
+    // the SECOND request, if the client reconnects, has nobody to answer it.
+    // That is what makes "did it reuse the socket?" a counter and not a guess.
+    var group: Io.Group = .init;
+    group.async(io, testServe, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(200));
+
+    var params: Params = .{
+        .io = io,
+        .address = server_addr,
+        .host = "127.0.0.1",
+        .request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        .is_tls = false,
+        .insecure = false,
+        .schedule = .closed,
+        // Bounds the reconnects that follow the first response, so the run
+        // reaches `end` instead of parking on a socket nobody is serving.
+        .timeout_ns = 20 * std.time.ns_per_ms,
+        .disable_keepalive = true,
+        .end = end,
+        .stop = &stop,
+        .histogram = &histogram,
+        .counters = &counters,
+    };
+    run(&params);
+
+    group.await(io) catch {};
+    server.deinit(io);
+
+    // Exactly one: the connection the server served. Without the flag this
+    // same setup completes dozens (see "closed schedule sends as fast as the
+    // server answers", which is this test minus `disable_keepalive`).
+    try testing.expectEqual(@as(u64, 1), counters.completed);
+    // And it did keep going — it reconnected rather than stopping — which is
+    // what distinguishes a retired connection from a dead run. The reconnects
+    // land on a listener nobody is accepting from any more, so they time out
+    // on the wire; that they are timeouts and not connect errors is the proof
+    // the socket was re-established each time.
+    try testing.expect(counters.timeouts > 0);
+    try testing.expectEqual(@as(u64, 0), counters.connect_errors);
+    // `record_timeouts` is on by default, so the histogram holds the timed-out
+    // attempts alongside the one response — the tail is not silently dropped
+    // just because the connection is being cycled.
+    try testing.expectEqual(counters.completed + counters.timeouts, histogram.count());
 }
 
 /// Serves HEAD-style responses: headers advertising a Content-Length that has

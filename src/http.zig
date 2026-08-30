@@ -47,7 +47,17 @@ pub fn buildRequest(allocator: std.mem.Allocator, cfg: *const cli.Config) ![]u8 
         try w.print("{s}: {s}\r\n", .{ h.name, h.value });
     }
     if (!has_ua) try w.writeAll("User-Agent: zrk\r\n");
-    if (!has_conn) try w.writeAll("Connection: keep-alive\r\n");
+    // Under `--disable-keepalive` the socket goes away after this response
+    // whatever the server answers (see `connection.run`), so say so: a
+    // compliant server can then release its end with the response instead of
+    // parking an idle connection until its own keep-alive timeout. An explicit
+    // `-H Connection: ...` still wins — the flag governs our socket, `-H`
+    // governs the bytes, and a run that wants to see how a server reacts to
+    // being told `keep-alive` while we close anyway is a legitimate probe.
+    if (!has_conn) try w.writeAll(if (cfg.disable_keepalive)
+        "Connection: close\r\n"
+    else
+        "Connection: keep-alive\r\n");
 
     if (!has_cl) {
         if (cfg.body.len > 0) {
@@ -343,6 +353,35 @@ test "buildRequest basic GET" {
     try testing.expect(std.mem.indexOf(u8, req, "Host: example.com\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, req, "Connection: keep-alive\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, req, "\r\n\r\n"));
+}
+
+test "buildRequest advertises close under --disable-keepalive" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var cfg = cli.Config{ .url = try cli.parseUrl("http://example.com/") };
+    cfg.disable_keepalive = true;
+    const req = try buildRequest(arena.allocator(), &cfg);
+    try testing.expect(std.mem.indexOf(u8, req, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, req, "Connection: keep-alive\r\n") == null);
+}
+
+test "an explicit -H Connection wins over --disable-keepalive's default" {
+    // The flag governs our socket; `-H` governs the bytes. Telling a server
+    // `keep-alive` while closing anyway is a legitimate probe of how it copes,
+    // and the header must not be silently doubled either way.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var cfg = cli.Config{
+        .url = try cli.parseUrl("http://example.com/"),
+        .headers = &.{.{ .name = "Connection", .value = "keep-alive" }},
+    };
+    cfg.disable_keepalive = true;
+    const req = try buildRequest(arena.allocator(), &cfg);
+    try testing.expect(std.mem.indexOf(u8, req, "Connection: close\r\n") == null);
+    try testing.expectEqual(
+        std.mem.indexOf(u8, req, "Connection: keep-alive\r\n"),
+        std.mem.lastIndexOf(u8, req, "Connection: keep-alive\r\n"),
+    );
 }
 
 test "buildRequest with non-default port, method, body, headers" {

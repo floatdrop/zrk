@@ -54,6 +54,22 @@ pub const Config = struct {
     /// form and with `--deadline`, both of which presuppose an offered
     /// schedule to fall behind.
     closed: bool = false,
+    /// Close the connection after every response and reconnect for the next
+    /// request (`--disable-keepalive`): one TCP connection per request, like
+    /// `ab` or oha's flag of the same name.
+    ///
+    /// Enforced on our side, not negotiated. zrk normally reuses a connection
+    /// unless the *response* declines to (`Connection: close`, or a
+    /// close-delimited body), so `-H 'Connection: close'` alone reconnects
+    /// only against servers that honour it — and leaves the ones that ignore
+    /// it running at full keep-alive speed, which is the opposite of the
+    /// comparison this flag exists to make. Closing regardless means every
+    /// target pays the same per-request connection cost.
+    ///
+    /// The request advertises `Connection: close` too (unless `-H` already set
+    /// a `Connection` header), so a compliant server can release its end
+    /// promptly instead of holding an idle socket until its own timeout.
+    disable_keepalive: bool = false,
     /// Per-request wire timeout: bounds the attempt on the wire, measured from
     /// the actual send (catches a hung socket / dead server). Does *not* bound
     /// coordinated-omission latency under overload — see `deadline_ns`.
@@ -161,6 +177,7 @@ pub const ParseError = error{
     ZeroRefresh,
     ClosedWithRamp,
     ClosedWithDeadline,
+    KeepaliveWithHttp2,
     OutOfMemory,
 };
 
@@ -199,6 +216,11 @@ pub const usage =
     \\                            No coordinated-omission correction; the rate
     \\                            finds its own ceiling instead of chasing one.
     \\                            Incompatible with a ramp (-R A:B) or --deadline
+    \\      --disable-keepalive   Close and reconnect after every response: one
+    \\                            connection per request, like ab. Enforced
+    \\                            client-side, so it also covers servers that
+    \\                            ignore the Connection: close it sends.
+    \\                            Not available with --http2
     \\  -H, --header  <K: V>      Add a request header (repeatable)
     \\  -m, --method      <M>     HTTP method                    (default GET)
     \\  -b, --body     <S|@FILE>  Request body; @FILE reads it from a file
@@ -290,6 +312,8 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
             cfg.plain = true;
         } else if (eq(arg, "--closed")) {
             cfg.closed = true;
+        } else if (eq(arg, "--disable-keepalive")) {
+            cfg.disable_keepalive = true;
         } else if (eq(arg, "--no-record-timeouts")) {
             cfg.record_timeouts = false;
         } else if (eq(arg, "--record-timeouts")) {
@@ -370,6 +394,11 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
     // behind for --deadline to measure against.
     if (cfg.closed and cfg.rate_end != null) return error.ClosedWithRamp;
     if (cfg.closed and cfg.deadline_ns != 0) return error.ClosedWithDeadline;
+    // HTTP/2 has no per-request connection to close. `Connection` is a
+    // malformed field in h2 (RFC 9113 section 8.2.2 — which is why
+    // `buildRequestBlock` omits it), and one stream per connection would
+    // measure the handshake rather than the protocol.
+    if (cfg.disable_keepalive and cfg.http2) return error.KeepaliveWithHttp2;
 
     const raw_url = url_arg orelse return error.MissingUrl;
     cfg.url = try parseUrl(raw_url);
@@ -611,6 +640,29 @@ test "closed flag parses; rejects ramp and deadline" {
     // not rejected) since a scalar -R can't be told apart from the default.
     const with_rate = (try parse(a, &[_][]const u8{ "--closed", "-R", "5000", "http://x/" })).config;
     try testing.expect(with_rate.closed);
+}
+
+test "disable-keepalive flag parses; rejects --http2" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Off by default: keep-alive is HTTP/1.1's default and zrk's.
+    const default = (try parse(a, &[_][]const u8{"http://x/"})).config;
+    try testing.expect(!default.disable_keepalive);
+
+    const cfg = (try parse(a, &[_][]const u8{ "--disable-keepalive", "-c", "64", "http://x/" })).config;
+    try testing.expect(cfg.disable_keepalive);
+    try testing.expectEqual(@as(u32, 64), cfg.connections);
+
+    // Orthogonal to the pacing mode: closed-loop + a connection per request is
+    // exactly the ab/oha comparison the flag exists for.
+    const with_closed = (try parse(a, &[_][]const u8{ "--closed", "--disable-keepalive", "http://x/" })).config;
+    try testing.expect(with_closed.closed and with_closed.disable_keepalive);
+
+    // h2 has no per-request connection to close, in either flag order.
+    try testing.expectError(error.KeepaliveWithHttp2, parse(a, &[_][]const u8{ "--disable-keepalive", "--http2", "http://x/" }));
+    try testing.expectError(error.KeepaliveWithHttp2, parse(a, &[_][]const u8{ "--http2", "--disable-keepalive", "http://x/" }));
 }
 
 test "refresh flag parses and zero is rejected" {
