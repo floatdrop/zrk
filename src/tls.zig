@@ -207,17 +207,25 @@ pub const State = struct {
                 error.RecordFailed => error.HandshakeTooLarge,
                 error.PeerClosed, error.TransportFailed => error.TransportFailed,
             };
-            const event = self.client.handleRecord(wire_record, &self.out_read) catch |err|
+            // One record can carry more than one message, so the first event
+            // comes from the record and the rest from `drain` until it
+            // answers null. Null is "nothing further", never "the last
+            // message resolved to nothing" â zssl skips those itself.
+            var event = self.client.handleRecord(wire_record, &self.out_read) catch |err|
                 return self.trust.classify(err);
-            switch (event) {
-                .none, .ticket => {},
-                .send => |bytes| try self.transportWrite(bytes),
-                .connected => |flight| try self.transportWrite(flight),
-                // Neither can arrive before `connected`; zssl answers
-                // `UnexpectedMessage` for the first and we asked for no early
-                // data, so this is a zssl bug rather than a peer's.
-                .application_data => unreachable,
-                .closed => return error.TransportFailed,
+            while (event) |ready| : (event = self.client.drain(&self.out_read) catch |err|
+                return self.trust.classify(err))
+            {
+                switch (ready) {
+                    .ticket => {},
+                    .send => |bytes| try self.transportWrite(bytes),
+                    .connected => |flight| try self.transportWrite(flight),
+                    // Neither can arrive before `connected`; zssl answers
+                    // `UnexpectedMessage` for the first and we offer no early
+                    // data, so this is a zssl bug rather than a peer's.
+                    .application_data => unreachable,
+                    .closed => return error.TransportFailed,
+                }
             }
         }
     }
@@ -313,26 +321,37 @@ pub const State = struct {
                     error.TransportFailed, error.RecordFailed => error.Failed,
                 };
             };
-            const event = self.client.handleRecord(wire_record, &self.out_read) catch {
+            var event = self.client.handleRecord(wire_record, &self.out_read) catch {
                 self.read_closed = true;
                 return error.Failed;
             };
-            switch (event) {
-                // A zero-length record is legal and carries nothing; keep
-                // reading rather than reporting a false end of stream.
-                .application_data => |plaintext| if (plaintext.len != 0) return plaintext,
-                // Post-handshake traffic: a KeyUpdate we must answer, or a
-                // ticket we have no use for.
-                .send => |bytes| self.transportWrite(bytes) catch {
-                    self.read_closed = true;
-                    return error.Failed;
-                },
-                .none, .ticket => {},
-                .closed => {
-                    self.read_closed = true;
-                    return error.EndOfStream;
-                },
-                .connected => unreachable, // Already connected.
+            // A record's inner content type is singular, so the drain only
+            // ever has more to say about a handshake record: a ticket packed
+            // with a KeyUpdate is what Go and OpenSSL emit, and reading just
+            // the first would strand the second until the next record.
+            // Returning below therefore leaves nothing behind â the record
+            // that carried application data carried only that.
+            while (event) |ready| : (event = self.client.drain(&self.out_read) catch {
+                self.read_closed = true;
+                return error.Failed;
+            }) {
+                switch (ready) {
+                    // A zero-length record is legal and carries nothing; keep
+                    // reading rather than reporting a false end of stream.
+                    .application_data => |plaintext| if (plaintext.len != 0) return plaintext,
+                    // Post-handshake traffic: a KeyUpdate we must answer, or a
+                    // ticket we have no use for.
+                    .send => |bytes| self.transportWrite(bytes) catch {
+                        self.read_closed = true;
+                        return error.Failed;
+                    },
+                    .ticket => {},
+                    .closed => {
+                        self.read_closed = true;
+                        return error.EndOfStream;
+                    },
+                    .connected => unreachable, // Already connected.
+                }
             }
         }
     }
