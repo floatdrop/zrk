@@ -37,8 +37,25 @@ var cfg: zrk.cli.Config = .{
     .interval_ns = 1 * std.time.ns_per_s,
     .url = try zrk.cli.parseUrl("http://127.0.0.1:8080/"),
 };
-const report = try zrk.runner.run(arena.allocator(), io, &cfg, 0, null, null);
+const report = try zrk.runner.run(arena.allocator(), io, &cfg, 0, null, null, null);
 ```
+
+`Report` carries the merged `snapshot` (counters plus the
+coordinated-omission-corrected histogram), `elapsed_s`, `launched`, and
+`interrupted`. It also carries `end_rate` / `end_bytes_per_sec` /
+`end_window_s` / `end_window_at_s`: throughput over the run's *last*
+`--interval` and where that window sat, rather than
+`completed / elapsed_s`. Under a ramp those differ by design — the whole-run
+average is the midpoint of the offered range and reports ~550 for `-R100:1000`
+no matter what the target did at the top of it, while `end_rate` is the rate it
+was actually serving when the run ended. A run shorter than one interval has no
+window of its own and falls back to the average.
+
+`report.writeJson` takes those as a `report.Run` alongside the snapshot, and
+reports `end_rate` as the summary's `achieved_rate` whenever `cfg.rate_end` is
+set (see [output.md](output.md)); an embedder computing its own headline number
+should make the same choice. Leaving `end_window_s` at 0 says "no window
+measured", and the whole run stands in for it.
 
 ## Which `std.Io` to pass
 

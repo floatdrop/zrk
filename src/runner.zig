@@ -27,7 +27,33 @@ pub const Report = struct {
     /// on these numbers (an SLO check, a regression baseline) must not treat an
     /// interrupted run as a completed one.
     interrupted: bool = false,
+    /// Throughput (req/s) over the run's *final* window — the last `--interval`
+    /// or so, measured the same way a `--timeseries` row is.
+    ///
+    /// `snapshot.counters.completed / elapsed_s` is the whole-run average: the
+    /// right number under constant load, and a misleading one under a ramp,
+    /// where `-R100:1000` averages ~550 no matter what the target sustained at
+    /// the top. This is the tail — what the target was actually serving when
+    /// the run ended. Falls back to the whole-run average for a run too short
+    /// to hold a window.
+    end_rate: f64 = 0,
+    /// Bytes/second over that same window, so the two stay proportional: a
+    /// consumer dividing one by the other gets bytes-per-request either way.
+    end_bytes_per_sec: f64 = 0,
+    /// Wall-clock length of the window `end_rate` was measured over. Equal to
+    /// `elapsed_s` when the run was too short for a window of its own.
+    end_window_s: f64 = 0,
+    /// Elapsed time at which that window *closed*, which is not `elapsed_s`:
+    /// the window ends at the last progress row, while `elapsed_s` is measured
+    /// after the fleet is joined. An interrupt widens that gap to most of an
+    /// `--interval` (a signal raises no row of its own), and a consumer placing
+    /// the window on a ramp's schedule has to know where it actually sat.
+    end_window_at_s: f64 = 0,
 };
+
+/// One published counter reading at a progress-row boundary. Kept so `run` can
+/// difference the last window out of the run (see `Report.end_rate`).
+const RowSample = struct { ns: i128, completed: u64, bytes: u64 };
 
 /// Which consumers a progress callback is for. The dashboard redraws on the
 /// (faster) `--refresh` cadence; `--timeseries` rows and `--plain` lines keep
@@ -185,6 +211,12 @@ pub fn run(
     var next_row: i128 = start.nanoseconds + row_ns;
     var next_frame: i128 = start.nanoseconds + frame_ns;
     var interrupted = false;
+    // Row-boundary counter readings, for the tail window computed after the
+    // loop. Four is enough to always hold one sample a full `--interval` back:
+    // rows land on the interval cadence, and only the last one (the flush at
+    // `end`) can sit a fraction of an interval after its predecessor.
+    var rows: [4]RowSample = undefined;
+    var row_count: usize = 0;
     while (true) {
         const before = Io.Timestamp.now(io, .awake);
         if (before.nanoseconds >= end.nanoseconds) break;
@@ -233,6 +265,14 @@ pub fn run(
         if (progress) |callback| {
             callback(progress_context, &snap, t.nanoseconds, elapsed_s, total_s, tick);
         }
+        if (tick.row) {
+            rows[row_count % rows.len] = .{
+                .ns = t.nanoseconds,
+                .completed = snap.counters.completed,
+                .bytes = snap.counters.bytes,
+            };
+            row_count += 1;
+        }
         if (at_end or interrupted) break;
     }
 
@@ -245,11 +285,81 @@ pub fn run(
     const elapsed = start.durationTo(Io.Timestamp.now(io, .awake));
     const elapsed_s: f64 = @as(f64, @floatFromInt(elapsed.nanoseconds)) / std.time.ns_per_s;
     fleet.readFinal(&snap);
+
+    const tail = tailWindow(rows[0..], row_count, cfg.interval_ns);
     return .{
         .snapshot = snap,
         .elapsed_s = elapsed_s,
         .launched = launched,
         .interrupted = interrupted,
+        .end_rate = if (tail) |t| t.rate else perSecond(snap.counters.completed, elapsed_s),
+        .end_bytes_per_sec = if (tail) |t| t.bytes_per_sec else perSecond(snap.counters.bytes, elapsed_s),
+        .end_window_s = if (tail) |t| t.seconds else elapsed_s,
+        .end_window_at_s = if (tail) |t|
+            @as(f64, @floatFromInt(t.end_ns - start.nanoseconds)) / std.time.ns_per_s
+        else
+            elapsed_s,
+    };
+}
+
+fn perSecond(count: u64, seconds: f64) f64 {
+    if (seconds <= 0) return 0;
+    return @as(f64, @floatFromInt(count)) / seconds;
+}
+
+/// Difference the run's last window out of the row-boundary ring: the earlier
+/// sample whose distance to the final one is closest to a whole `--interval`,
+/// against that final one. Null when fewer than two rows landed (a run shorter
+/// than a single window).
+///
+/// Closest-to-an-interval rather than the plainer "newest sample at least an
+/// interval back", because neither end of the run lands on the grid exactly.
+/// Rows fire a wake-latency after their deadline while the end-of-run flush
+/// fires at `end` on the dot, so the last gap is a hair *under* an interval
+/// about as often as it is over — an at-least rule would reach a whole extra
+/// interval back on a coin flip, and the reported window would flip between one
+/// and two intervals across identical runs. It also declines to measure the
+/// sliver left by a duration that isn't a whole number of intervals (`-d 10.05s
+/// --interval 1s` ends with a 50ms row), preferring the 1.05s window over it.
+///
+/// Both ends come from *published* snapshots on purpose. A connection publishes
+/// its counters on its own cadence, so any snapshot lags reality by up to one
+/// publish interval; differencing two of them cancels that lag, while
+/// differencing the last row against the post-join live counters would charge
+/// every connection's unpublished backlog to this one window and overstate it.
+/// It also makes the number identical to the last `--timeseries` row whenever
+/// that row covers a full interval.
+fn tailWindow(ring: []const RowSample, count: usize, interval_ns: u64) ?struct {
+    rate: f64,
+    bytes_per_sec: f64,
+    seconds: f64,
+    /// Timestamp the window closed on, in the ring's own clock.
+    end_ns: i128,
+} {
+    if (count < 2) return null;
+    const last = ring[(count - 1) % ring.len];
+    const want: i128 = @intCast(interval_ns);
+
+    var base: ?RowSample = null;
+    var best_miss: i128 = 0;
+    var i = count -| ring.len;
+    while (i + 1 < count) : (i += 1) {
+        const s = ring[i % ring.len];
+        const span = last.ns - s.ns;
+        if (span <= 0) continue;
+        const miss = @max(span - want, want - span);
+        if (base == null or miss < best_miss) {
+            base = s;
+            best_miss = miss;
+        }
+    }
+    const b = base orelse return null;
+    const seconds = @as(f64, @floatFromInt(last.ns - b.ns)) / std.time.ns_per_s;
+    return .{
+        .rate = perSecond(last.completed -| b.completed, seconds),
+        .bytes_per_sec = perSecond(last.bytes -| b.bytes, seconds),
+        .seconds = seconds,
+        .end_ns = last.ns,
     };
 }
 
@@ -308,6 +418,80 @@ fn testServe(io: Io, server: *net.Server) void {
     }
 }
 
+test "tailWindow measures the last full interval, not the last partial row" {
+    const s_ns: i128 = std.time.ns_per_s;
+    const interval: u64 = std.time.ns_per_s;
+
+    // Rows on a 1s grid, then the end-of-run flush 0.2s past the last one — the
+    // shape of any duration that isn't a whole number of intervals. That sliver
+    // holds 200 requests, so measuring it alone would claim 1000 req/s off a
+    // fifth of a second; the window has to reach back past the 4s row to the 3s
+    // one, where the true 800-over-1.2s shows.
+    var ring: [4]RowSample = .{
+        .{ .ns = 2 * s_ns, .completed = 2000, .bytes = 80000 },
+        .{ .ns = 3 * s_ns, .completed = 3000, .bytes = 120000 },
+        .{ .ns = 4 * s_ns, .completed = 3600, .bytes = 144000 },
+        .{ .ns = 4 * s_ns + s_ns / 5, .completed = 3800, .bytes = 152000 },
+    };
+    const partial = tailWindow(&ring, 4, interval).?;
+    try testing.expectApproxEqAbs(@as(f64, 1.2), partial.seconds, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 800.0 / 1.2), partial.rate, 1e-6);
+
+    // Rows landing exactly on the grid: one interval back is the whole window,
+    // and no further — reaching back two would blend the previous second in.
+    ring[3] = .{ .ns = 5 * s_ns, .completed = 4500, .bytes = 180000 };
+    const aligned = tailWindow(&ring, 4, interval).?;
+    try testing.expectApproxEqAbs(@as(f64, 1.0), aligned.seconds, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 900), aligned.rate, 1e-6);
+
+    // Rows fire a wake-latency late, the end-of-run flush fires on the dot, so
+    // the last gap comes in a hair *under* an interval as often as over. Both
+    // sides of that coin flip must report the same one-interval window.
+    ring = .{
+        .{ .ns = 1 * s_ns + 200_000, .completed = 1000, .bytes = 40000 },
+        .{ .ns = 2 * s_ns + 300_000, .completed = 2000, .bytes = 80000 },
+        .{ .ns = 3 * s_ns + 400_000, .completed = 3000, .bytes = 120000 },
+        .{ .ns = 4 * s_ns, .completed = 3900, .bytes = 156000 },
+    };
+    const jittered = tailWindow(&ring, 4, interval).?;
+    try testing.expectApproxEqAbs(@as(f64, 0.9996), jittered.seconds, 1e-6);
+    try testing.expect(jittered.rate > 890 and jittered.rate < 910);
+
+    // A duration that isn't a whole number of intervals ends on a sliver:
+    // `-d 4.05s --interval 1s` flushes 50ms after the 4s row. 50ms of traffic
+    // is not a throughput measurement, so the window before it wins.
+    ring = .{
+        .{ .ns = 1 * s_ns, .completed = 1000, .bytes = 40000 },
+        .{ .ns = 2 * s_ns, .completed = 2000, .bytes = 80000 },
+        .{ .ns = 3 * s_ns, .completed = 3000, .bytes = 120000 },
+        .{ .ns = 4 * s_ns + s_ns / 20, .completed = 4050, .bytes = 162000 },
+    };
+    const sliver = tailWindow(&ring, 4, interval).?;
+    try testing.expectApproxEqAbs(@as(f64, 1.05), sliver.seconds, 1e-6);
+    try testing.expectApproxEqAbs(@as(f64, 1050.0 / 1.05), sliver.rate, 1e-6);
+
+    // A run too short to hold two rows has no window of its own; the caller
+    // falls back to the whole-run average.
+    try testing.expect(tailWindow(&ring, 1, interval) == null);
+    try testing.expect(tailWindow(&ring, 0, interval) == null);
+}
+
+test "tailWindow reads a ramp's tail, not its average" {
+    // 4s of a ramp sampled once a second: 100, 300, 500 and 700 requests per
+    // second. The whole-run average (1600/4 = 400) describes no second of it;
+    // the tail is the 700 the ramp actually reached.
+    const s_ns: i128 = std.time.ns_per_s;
+    const ring: [4]RowSample = .{
+        .{ .ns = 1 * s_ns, .completed = 100, .bytes = 4000 },
+        .{ .ns = 2 * s_ns, .completed = 400, .bytes = 16000 },
+        .{ .ns = 3 * s_ns, .completed = 900, .bytes = 36000 },
+        .{ .ns = 4 * s_ns, .completed = 1600, .bytes = 64000 },
+    };
+    const tail = tailWindow(&ring, 4, std.time.ns_per_s).?;
+    try testing.expectApproxEqAbs(@as(f64, 700), tail.rate, 1e-6);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), tail.seconds, 1e-9);
+}
+
 test "run's elapsed time tracks the duration, not the interval grid" {
     var rt = try zio.Runtime.init(testing.allocator, .{});
     defer rt.deinit();
@@ -347,6 +531,14 @@ test "run's elapsed time tracks the duration, not the interval grid" {
     // the quantization regression would report >= 1.0s.
     try testing.expect(result.elapsed_s >= 0.29);
     try testing.expect(result.elapsed_s < 0.9);
+    // Shorter than one --interval, so there is no tail window to difference:
+    // `end_rate` falls back to the whole-run average rather than reporting 0.
+    try testing.expectApproxEqAbs(result.end_window_s, result.elapsed_s, 1e-9);
+    try testing.expectApproxEqAbs(
+        @as(f64, @floatFromInt(result.snapshot.counters.completed)) / result.elapsed_s,
+        result.end_rate,
+        1e-6,
+    );
 }
 
 test "an interrupted run keeps its measurement and says it was cut short" {
