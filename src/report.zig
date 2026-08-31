@@ -57,6 +57,38 @@ pub fn checkSlo(cfg: *const cli.Config, snap: *const stats.Snapshot) SloResult {
     return r;
 }
 
+/// Offered *total* target rate (req/s) at elapsed `t_s`, honoring a ramp — the
+/// schedule `pace` is driving, sampled for reporting. Constant when `-R` has no
+/// end, and clamped to the ramp's endpoints outside the configured duration.
+/// `--closed` has no offered rate at all; callers substitute the achieved one
+/// there (which is what makes its rate ratios 1).
+pub fn offeredRate(cfg: *const cli.Config, t_s: f64) f64 {
+    const start: f64 = @floatFromInt(cfg.rate);
+    const end_rate = cfg.rate_end orelse return start;
+    const end: f64 = @floatFromInt(end_rate);
+    const dur = @as(f64, @floatFromInt(cfg.duration_ns)) / std.time.ns_per_s;
+    if (dur <= 0) return end;
+    const frac = std.math.clamp(t_s / dur, 0, 1);
+    return start + (end - start) * frac;
+}
+
+/// The run-level facts the summary reports alongside the merged snapshot —
+/// `runner.Report` minus the snapshot itself. A struct rather than a tail of
+/// positional parameters so that adding a measurement doesn't reshuffle every
+/// call site.
+pub const Run = struct {
+    elapsed_s: f64,
+    launched: u32,
+    interrupted: bool = false,
+    /// Throughput over the run's final `--interval` window, and when that
+    /// window closed; see `runner.Report.end_rate`. A caller with no window to
+    /// report leaves `end_window_s` at 0, and the whole run stands in for it.
+    end_rate: f64 = 0,
+    end_bytes_per_sec: f64 = 0,
+    end_window_s: f64 = 0,
+    end_window_at_s: f64 = 0,
+};
+
 /// Write the JSON run summary. Latencies are microseconds (the histogram's
 /// native unit); `duration_s`/`*_rate` are derived from the measured elapsed
 /// time. `latency_histogram` is the full distribution as an HdrHistogram V2
@@ -68,26 +100,61 @@ pub fn writeJson(
     w: *Io.Writer,
     cfg: *const cli.Config,
     snap: *const stats.Snapshot,
-    elapsed_s: f64,
-    launched: u32,
-    interrupted: bool,
+    run: Run,
 ) !void {
     const c = snap.counters;
     const h = &snap.hist;
-    const achieved: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.completed)) / elapsed_s else 0;
-    const bps: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.bytes)) / elapsed_s else 0;
-    // For a ramp, compare achieved throughput against the *average* offered rate
-    // (start+end)/2; for a constant run this is just the rate. In --closed mode
-    // there is no offered rate to compare against — report target == achieved
-    // (rate_ratio == 1) so a consumer that doesn't special-case --closed still
-    // gets coherent numbers instead of the unrelated default `rate`.
+    const elapsed_s = run.elapsed_s;
+    const ramping = cfg.rate_end != null;
     const rate_end = cfg.rate_end orelse cfg.rate;
-    const target_rate: u64 = if (cfg.closed) @intFromFloat(@round(achieved)) else cfg.rate;
-    const target_rate_end: u64 = if (cfg.closed) target_rate else rate_end;
-    const avg_target: f64 = if (cfg.closed)
-        achieved
+    const mean_rate: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.completed)) / elapsed_s else 0;
+    const mean_bps: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.bytes)) / elapsed_s else 0;
+
+    // An embedder driving `runner.run` gets a measured window; one building a
+    // `Run` by hand (the library docs show only `elapsed_s`/`launched`) may
+    // report none. The whole run is then the only window there is — without
+    // this a ramp's `achieved_rate` would come out 0.00 rather than merely
+    // coarse, and --closed's ratios would contradict their documented 1.0.
+    const measured = run.end_window_s > 0;
+    const end_rate: f64 = if (measured) run.end_rate else mean_rate;
+    const end_bps: f64 = if (measured) run.end_bytes_per_sec else mean_bps;
+    const end_window_s: f64 = if (measured) run.end_window_s else elapsed_s;
+    // Judged on its own, so a caller that reported a window but not when it
+    // closed lands where `runner.run` puts it bar the fleet join, rather than
+    // at second zero — where a ramp's schedule would read as its start rate.
+    const end_window_at_s: f64 = if (run.end_window_at_s > 0) run.end_window_at_s else elapsed_s;
+
+    // Headline throughput. Averaging the whole run is right under constant load
+    // and wrong under a ramp, where the average is the midpoint of the offered
+    // range and describes no part of the run: `-R100:1000` reports ~550 whether
+    // the target held 1000 to the top or fell over at 200. So a ramp reports
+    // its *tail* — the last `end_window_s`, the rate the target was actually
+    // serving when the run ended, which is the number the ramp was run to find.
+    // The average is still `requests / duration_s` for anyone who wants it.
+    const achieved: f64 = if (ramping) end_rate else mean_rate;
+    const bps: f64 = if (ramping) end_bps else mean_bps;
+
+    // The offered load to hold `achieved` against, over the span it was actually
+    // measured over: the ramp's schedule at the tail window's midpoint, or the
+    // flat rate. In --closed mode there is no offered rate at all — report
+    // target == achieved (rate_ratio == 1) so a consumer that doesn't
+    // special-case --closed still gets coherent numbers instead of the
+    // unrelated default `rate`. (--closed and a ramp are mutually exclusive,
+    // so `achieved` is the average in every --closed branch here.)
+    // Anchored on when the window *closed*, not on `elapsed_s`: the two differ
+    // by the fleet join, and by most of an `--interval` when a signal cut the
+    // run short between rows. Reading the schedule that far further up a ramp
+    // overstates the offered load and books a kept ramp as short.
+    const window_mid_s = end_window_at_s - end_window_s / 2.0;
+    const offered_end: f64 = if (cfg.closed) end_rate else offeredRate(cfg, window_mid_s);
+    const target_rate: u64 = if (cfg.closed) @intFromFloat(@round(mean_rate)) else cfg.rate;
+    const target_rate_end: u64 = if (cfg.closed) @intFromFloat(@round(end_rate)) else rate_end;
+    const offered: f64 = if (cfg.closed)
+        mean_rate
+    else if (ramping)
+        offered_end
     else
-        (@as(f64, @floatFromInt(cfg.rate)) + @as(f64, @floatFromInt(rate_end))) / 2.0;
+        @as(f64, @floatFromInt(cfg.rate));
 
     try w.writeAll("{\n");
     try w.print("  \"zrk_version\": \"{s}\",\n", .{cli.version});
@@ -98,16 +165,23 @@ pub fn writeJson(
     try writeJsonString(w, cfg.method);
     try w.writeAll(" },\n");
 
+    // The configuration as given, not as interpreted: `target_rate`/
+    // `target_rate_end` here are the `-R` endpoints verbatim (equal for a
+    // constant run), while the top-level pair below is the *offered* schedule,
+    // which --closed redefines. `interval_s` is the stats window, and so the
+    // window `achieved_rate_end` is measured over.
     try w.writeAll("  \"config\": {");
     try w.print(
-        " \"connections\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"closed\": {}, \"disable_keepalive\": {}, \"target_rate\": {d}, \"timeout_ms\": {d}, \"deadline_ms\": {d}, \"deadline_abort\": {}, \"record_timeouts\": {} }},\n",
+        " \"connections\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"interval_s\": {d:.3}, \"closed\": {}, \"disable_keepalive\": {}, \"target_rate\": {d}, \"target_rate_end\": {d}, \"timeout_ms\": {d}, \"deadline_ms\": {d}, \"deadline_abort\": {}, \"record_timeouts\": {} }},\n",
         .{
             cfg.connections,
-            launched,
+            run.launched,
             @as(f64, @floatFromInt(cfg.duration_ns)) / std.time.ns_per_s,
+            @as(f64, @floatFromInt(cfg.interval_ns)) / std.time.ns_per_s,
             cfg.closed,
             cfg.disable_keepalive,
             cfg.rate,
+            rate_end,
             cfg.timeout_ns / std.time.ns_per_ms,
             cfg.deadline_ns / std.time.ns_per_ms,
             cfg.deadline_abort,
@@ -119,13 +193,30 @@ pub fn writeJson(
     // Explicit rather than leaving a consumer to infer it from duration_s being
     // short of config.duration_s: an interrupted run is not a completed one, and
     // whatever reads this (a CI gate, a regression baseline) needs to say so.
-    if (interrupted) try w.print("  \"interrupted\": true,\n", .{});
+    if (run.interrupted) try w.print("  \"interrupted\": true,\n", .{});
     try w.print("  \"requests\": {d},\n", .{c.completed});
     try w.print("  \"bytes\": {d},\n", .{c.bytes});
     try w.print("  \"achieved_rate\": {d:.2},\n", .{achieved});
     try w.print("  \"target_rate\": {d},\n", .{target_rate});
     try w.print("  \"target_rate_end\": {d},\n", .{target_rate_end});
-    try w.print("  \"rate_ratio\": {d:.4},\n", .{if (avg_target > 0) achieved / avg_target else 0});
+    try w.print("  \"rate_ratio\": {d:.4},\n", .{if (offered > 0) achieved / offered else 0});
+    // The tail, unconditionally — so a harness can read one key without first
+    // working out whether a ramp was configured. Under a ramp these are the
+    // same two numbers as above; under constant load they are the last window
+    // rather than the whole run, which is how a target that degraded partway
+    // through shows up at all.
+    //
+    // Both ratios divide by the offered load averaged over the window the rate
+    // was measured across, never by `target_rate_end`. `achieved_rate_end` is
+    // an average over a window during which a ramp keeps climbing, while
+    // `target_rate_end` is the schedule's value at the final instant; dividing
+    // one by the other would book a perfectly kept ramp as short by half a
+    // window of slope.
+    try w.print("  \"achieved_rate_end\": {d:.2},\n", .{end_rate});
+    try w.print("  \"rate_ratio_end\": {d:.4},\n", .{
+        if (offered_end > 0) end_rate / offered_end else 0,
+    });
+    try w.print("  \"end_window_s\": {d:.3},\n", .{end_window_s});
     try w.print("  \"bytes_per_sec\": {d:.2},\n", .{bps});
     try w.print("  \"error_rate\": {d:.6},\n", .{errorRate(c)});
     // Peak schedule lag (µs): how far behind its intended send the fleet ever
@@ -198,19 +289,6 @@ pub const TimeSeries = struct {
         self.scratch.deinit();
     }
 
-    /// Offered *total* target rate (req/s) at elapsed `t_s`, honoring a ramp.
-    /// `.closed` has no offered rate; the caller substitutes the interval's
-    /// own achieved rate instead (rate_ratio == 1 there too).
-    fn targetRate(self: *const TimeSeries, t_s: f64) f64 {
-        const start: f64 = @floatFromInt(self.cfg.rate);
-        const end_rate = self.cfg.rate_end orelse return start;
-        const end: f64 = @floatFromInt(end_rate);
-        const dur = @as(f64, @floatFromInt(self.cfg.duration_ns)) / std.time.ns_per_s;
-        if (dur <= 0) return end;
-        const frac = std.math.clamp(t_s / dur, 0, 1);
-        return start + (end - start) * frac;
-    }
-
     /// Emit the line for the interval ending at `elapsed_s` and advance state.
     pub fn record(self: *TimeSeries, snap: *const stats.Snapshot, elapsed_s: f64) !void {
         self.delta.setToDifference(&snap.hist, &self.prev_cum);
@@ -235,6 +313,13 @@ pub const TimeSeries = struct {
         const achieved: f64 = if (interval_s > 0) @as(f64, @floatFromInt(d_completed)) / interval_s else 0;
         const bps: f64 = if (interval_s > 0) @as(f64, @floatFromInt(d_bytes)) / interval_s else 0;
 
+        // `target_rate` is the load offered *across* this window — the ramp's
+        // schedule at its midpoint — not the schedule at the instant the window
+        // closes. `achieved_rate` beside it is a window average, and a ramp
+        // climbs while the window runs, so the endpoint would sit half a window
+        // of slope above it: plotted together (the README's jplot pipeline), a
+        // target that kept its schedule perfectly would draw a permanent gap.
+        //
         // `error_rate` is this window's failure fraction, computed exactly like
         // the summary's — so a row is directly comparable to the final number
         // and to the `--max-error-rate` gate, and stays on one 0..1 axis no
@@ -243,7 +328,7 @@ pub const TimeSeries = struct {
             "{{\"t\":{d:.3},\"target_rate\":{d:.1},\"achieved_rate\":{d:.1},\"requests\":{d}," ++
                 "\"errors\":{d},\"error_rate\":{d:.6},",
             .{
-                elapsed_s, if (self.cfg.closed) achieved else self.targetRate(elapsed_s),
+                elapsed_s, if (self.cfg.closed) achieved else offeredRate(self.cfg, elapsed_s - interval_s / 2),
                 achieved,  d_completed,
                 d_errors,  failureFraction(d_completed, d_status, d_failures),
             },
@@ -356,7 +441,7 @@ test "writeJson emits parseable, well-formed summary" {
     defer alloc.deinit();
     var cfg = testConfig();
     cfg.deadline_ns = 250 * std.time.ns_per_ms;
-    try writeJson(testing.allocator, &alloc.writer, &cfg, &snap, 1.0, 4, false);
+    try writeJson(testing.allocator, &alloc.writer, &cfg, &snap, .{ .elapsed_s = 1.0, .launched = 4, .end_rate = 100, .end_window_s = 1.0 });
     const out = alloc.written();
 
     // Spot-check structure and key fields.
@@ -391,7 +476,8 @@ test "writeJson reports target_rate as achieved under --closed" {
     defer alloc.deinit();
     var cfg = testConfig();
     cfg.closed = true; // cfg.rate is still the unrelated default 1000
-    try writeJson(testing.allocator, &alloc.writer, &cfg, &snap, 1.0, 4, false);
+    try writeJson(testing.allocator, &alloc.writer, &cfg, &snap, .{ .elapsed_s = 1.0, .launched = 4, .end_rate = 500, .end_window_s = 1.0 });
+    // --closed cannot ramp, so achieved_rate stays the whole-run average here.
     const out = alloc.written();
 
     try testing.expect(std.mem.indexOf(u8, out, "\"closed\": true") != null);
@@ -403,6 +489,213 @@ test "writeJson reports target_rate as achieved under --closed" {
     try testing.expect(std.mem.indexOf(u8, out, "\"target_rate\": 500,") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"target_rate_end\": 500,") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"rate_ratio\": 1.0000") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"achieved_rate_end\": 500.00") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"rate_ratio_end\": 1.0000") != null);
+}
+
+test "a ramp's achieved_rate is its tail, not its whole-run average" {
+    var snap: stats.Snapshot = .{
+        .hist = try stats.newHistogram(testing.allocator),
+        .counters = .{},
+    };
+    defer snap.deinit();
+
+    // A 10s -R100:1000 ramp that kept its schedule exactly: 5500 requests, so
+    // the whole run averages 550 — the midpoint of the offered range, and a
+    // number the target never served for a moment.
+    snap.counters.completed = 5500;
+    snap.counters.bytes = 220_000;
+    snap.counters.recordStatus(200);
+
+    var alloc = Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    var cfg = testConfig();
+    cfg.rate = 100;
+    cfg.rate_end = 1000;
+    cfg.duration_ns = 10 * std.time.ns_per_s;
+    try writeJson(testing.allocator, &alloc.writer, &cfg, &snap, .{
+        .elapsed_s = 10.0,
+        .launched = 4,
+        // The final second of that ramp offers 910..1000, averaging 955 — so a
+        // target that held the schedule to the top reports 955, not 1000.
+        .end_rate = 955,
+        .end_bytes_per_sec = 38_200,
+        .end_window_s = 1.0,
+    });
+    const out = alloc.written();
+
+    // The config section carries both ends of `-R`, so a consumer can see what
+    // was asked for without re-parsing the command line.
+    try testing.expect(std.mem.indexOf(u8, out, "\"target_rate\": 100, \"target_rate_end\": 1000,") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"interval_s\": 1.000") != null);
+
+    // The headline throughput is the tail. `rate_ratio` holds it against the
+    // load offered over that same second (955), not against the ramp's endpoint
+    // (1000) — an endpoint comparison would report 0.955 for a run that missed
+    // nothing.
+    try testing.expect(std.mem.indexOf(u8, out, "\"achieved_rate\": 955.00") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"rate_ratio\": 1.0000") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"bytes_per_sec\": 38200.00") != null);
+    // The average is emphatically not the headline, but stays recoverable from
+    // the two fields it is the quotient of.
+    try testing.expect(std.mem.indexOf(u8, out, "\"achieved_rate\": 550") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"requests\": 5500") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"duration_s\": 10.000") != null);
+
+    // The unconditional tail keys mirror them under a ramp.
+    try testing.expect(std.mem.indexOf(u8, out, "\"achieved_rate_end\": 955.00") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"rate_ratio_end\": 1.0000") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"end_window_s\": 1.000") != null);
+}
+
+test "an interrupted ramp is judged where its window actually sat" {
+    var snap: stats.Snapshot = .{
+        .hist = try stats.newHistogram(testing.allocator),
+        .counters = .{},
+    };
+    defer snap.deinit();
+    snap.counters.completed = 1000;
+    snap.counters.recordStatus(200);
+
+    var alloc = Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    var cfg = testConfig();
+    cfg.rate = 100;
+    cfg.rate_end = 1000;
+    cfg.duration_ns = 60 * std.time.ns_per_s;
+    cfg.interval_ns = 5 * std.time.ns_per_s;
+
+    // Ctrl-C at t=24s, 4s after the last progress row: a signal raises no row
+    // of its own, so the tail window is [15s, 20s] while `elapsed_s` is 24.
+    // Over that window the ramp offered 325..400, averaging 362.5 — which the
+    // client served exactly. Anchoring on `elapsed_s` instead would read the
+    // schedule at 21.5s (~423) and book a kept ramp at 0.857.
+    try writeJson(testing.allocator, &alloc.writer, &cfg, &snap, .{
+        .elapsed_s = 24.0,
+        .launched = 4,
+        .interrupted = true,
+        .end_rate = 362.5,
+        .end_bytes_per_sec = 14_500,
+        .end_window_s = 5.0,
+        .end_window_at_s = 20.0,
+    });
+    const out = alloc.written();
+
+    try testing.expect(std.mem.indexOf(u8, out, "\"interrupted\": true") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"achieved_rate\": 362.50") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"rate_ratio\": 1.0000") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"rate_ratio_end\": 1.0000") != null);
+}
+
+test "writeJson stands the whole run in for a Run that reports no window" {
+    var snap: stats.Snapshot = .{
+        .hist = try stats.newHistogram(testing.allocator),
+        .counters = .{},
+    };
+    defer snap.deinit();
+    snap.counters.completed = 5500;
+    snap.counters.bytes = 220_000;
+    snap.counters.recordStatus(200);
+
+    var alloc = Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    var cfg = testConfig();
+    cfg.rate = 100;
+    cfg.rate_end = 1000;
+    cfg.duration_ns = 10 * std.time.ns_per_s;
+
+    // What an embedder building `Run` by hand gets — the library docs show only
+    // `elapsed_s` and `launched`. Without the fallback a ramp's headline rate
+    // would be the zero default rather than merely coarse.
+    try writeJson(testing.allocator, &alloc.writer, &cfg, &snap, .{
+        .elapsed_s = 10.0,
+        .launched = 4,
+    });
+    const out = alloc.written();
+    try testing.expect(std.mem.indexOf(u8, out, "\"achieved_rate\": 550.00") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"bytes_per_sec\": 22000.00") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"end_window_s\": 10.000") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"achieved_rate\": 0.00") == null);
+
+    // Same for --closed, whose documented ratios are unconditionally 1.0.
+    var closed_out = Io.Writer.Allocating.init(testing.allocator);
+    defer closed_out.deinit();
+    var closed = testConfig();
+    closed.closed = true;
+    try writeJson(testing.allocator, &closed_out.writer, &closed, &snap, .{
+        .elapsed_s = 10.0,
+        .launched = 4,
+    });
+    try testing.expect(std.mem.indexOf(u8, closed_out.written(), "\"rate_ratio\": 1.0000") != null);
+    try testing.expect(std.mem.indexOf(u8, closed_out.written(), "\"rate_ratio_end\": 1.0000") != null);
+    try testing.expect(std.mem.indexOf(u8, closed_out.written(), "\"target_rate_end\": 550,") != null);
+}
+
+test "a ramp's time-series rows offer the load averaged across each window" {
+    var cfg = testConfig();
+    cfg.rate = 100;
+    cfg.rate_end = 1000;
+    cfg.duration_ns = 10 * std.time.ns_per_s;
+
+    var alloc = Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    var ts = try TimeSeries.init(testing.allocator, &alloc.writer, &cfg);
+    defer ts.deinit();
+
+    var snap: stats.Snapshot = .{
+        .hist = try stats.newHistogram(testing.allocator),
+        .counters = .{},
+    };
+    defer snap.deinit();
+
+    // A client keeping the schedule exactly: the second ending at t=2 is
+    // offered 190..280, so it serves 235. `target_rate` has to be that same
+    // 235 average, not the 280 the schedule reads at the closing instant —
+    // otherwise `jplot achieved_rate+target_rate` draws a standing gap for a
+    // run that missed nothing.
+    snap.hist.record(1000);
+    snap.counters.completed = 145;
+    try ts.record(&snap, 1.0);
+    snap.counters.completed = 145 + 235;
+    try ts.record(&snap, 2.0);
+
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, alloc.written(), "\n"), '\n');
+    try testing.expect(std.mem.indexOf(u8, it.next().?, "\"target_rate\":145.0,\"achieved_rate\":145.0,") != null);
+    try testing.expect(std.mem.indexOf(u8, it.next().?, "\"target_rate\":235.0,\"achieved_rate\":235.0,") != null);
+}
+
+test "constant load keeps the whole-run average as achieved_rate" {
+    var snap: stats.Snapshot = .{
+        .hist = try stats.newHistogram(testing.allocator),
+        .counters = .{},
+    };
+    defer snap.deinit();
+
+    // 10s at a flat 1000 req/s, but the last second only managed 400: the run
+    // average stays the headline (there is no ramp to make it misleading),
+    // while the tail keys are what expose the late collapse.
+    snap.counters.completed = 9400;
+    snap.counters.bytes = 376_000;
+    snap.counters.recordStatus(200);
+
+    var alloc = Io.Writer.Allocating.init(testing.allocator);
+    defer alloc.deinit();
+    var cfg = testConfig(); // constant -R 1000
+    cfg.duration_ns = 10 * std.time.ns_per_s;
+    try writeJson(testing.allocator, &alloc.writer, &cfg, &snap, .{
+        .elapsed_s = 10.0,
+        .launched = 4,
+        .end_rate = 400,
+        .end_bytes_per_sec = 16_000,
+        .end_window_s = 1.0,
+    });
+    const out = alloc.written();
+
+    try testing.expect(std.mem.indexOf(u8, out, "\"achieved_rate\": 940.00") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"rate_ratio\": 0.9400") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"bytes_per_sec\": 37600.00") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"achieved_rate_end\": 400.00") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"rate_ratio_end\": 0.4000") != null);
 }
 
 test "time series row carries the interval HDR blob when enabled" {

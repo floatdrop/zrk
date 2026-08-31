@@ -112,18 +112,28 @@ pub fn main(init: std.process.Init) !void {
     };
     var snapshot = result.snapshot;
 
+    const run_facts: report.Run = .{
+        .elapsed_s = result.elapsed_s,
+        .launched = result.launched,
+        .interrupted = result.interrupted,
+        .end_rate = result.end_rate,
+        .end_bytes_per_sec = result.end_bytes_per_sec,
+        .end_window_s = result.end_window_s,
+        .end_window_at_s = result.end_window_at_s,
+    };
+
     if (json) {
-        try writeJsonReport(arena, io, &cfg, &snapshot, result.elapsed_s, result.launched, result.interrupted);
+        try writeJsonReport(arena, io, &cfg, &snapshot, run_facts);
     } else if (cfg.output_path) |path| {
         // Text report redirected to --output; leave a breadcrumb on stdout —
         // unless the time series owns stdout, where a breadcrumb would land
         // mid-stream as a line no NDJSON reader can parse.
-        try writeTextReport(io, &dash, path, &snapshot, result.elapsed_s);
+        try writeTextReport(io, &dash, path, &snapshot, run_facts);
         if (!ts_stdout) try dash.finalRedirected(path);
     } else if (ts_stdout) {
-        try writeSummaryToStderr(io, &dash, &snapshot, result.elapsed_s);
+        try writeSummaryToStderr(io, &dash, &snapshot, run_facts);
     } else {
-        try dash.final(&snapshot, result.elapsed_s);
+        try dash.final(&snapshot, run_facts);
     }
 
     // Optional HdrHistogram percentile distribution (.hgrm) export.
@@ -203,18 +213,18 @@ fn watchSignal(io: Io, spec: SignalSpec, it: *Interrupt, notify: bool) void {
 }
 
 /// Write the wrk2-style text report to `--output` (text mode with -o set).
-fn writeTextReport(io: Io, dash: *tui.Dashboard, path: []const u8, snap: *const stats.Snapshot, elapsed_s: f64) !void {
+fn writeTextReport(io: Io, dash: *tui.Dashboard, path: []const u8, snap: *const stats.Snapshot, run: report.Run) !void {
     const file = try Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
     var buf: [8192]u8 = undefined;
     var fw: Io.File.Writer = .init(file, io, &buf);
-    try dash.writeFinalSummary(&fw.interface, snap, elapsed_s);
+    try dash.writeFinalSummary(&fw.interface, snap, run);
     try fw.interface.flush();
 }
 
 /// Write the JSON summary to `--output` (or stdout when unset; stderr when
 /// `--timeseries -` has claimed stdout for the row stream).
-fn writeJsonReport(gpa: std.mem.Allocator, io: Io, cfg: *const cli.Config, snap: *const stats.Snapshot, elapsed_s: f64, launched: u32, interrupted: bool) !void {
+fn writeJsonReport(gpa: std.mem.Allocator, io: Io, cfg: *const cli.Config, snap: *const stats.Snapshot, run: report.Run) !void {
     var close = false;
     const fallback: Io.File = if (cfg.timeseriesOnStdout()) .stderr() else .stdout();
     const file = try openOut(io, cfg.output_path, fallback, &close);
@@ -228,20 +238,20 @@ fn writeJsonReport(gpa: std.mem.Allocator, io: Io, cfg: *const cli.Config, snap:
         .init(file, io, &buf)
     else
         .initStreaming(file, io, &buf);
-    try report.writeJson(gpa, &fw.interface, cfg, snap, elapsed_s, launched, interrupted);
+    try report.writeJson(gpa, &fw.interface, cfg, snap, run);
     try fw.interface.flush();
 }
 
 /// Write the compact text summary to stderr. Used when `--timeseries -` owns
 /// stdout and no `--output` was given: the run still has to report itself
 /// somewhere, and stderr is the stream a plotting pipe leaves free.
-fn writeSummaryToStderr(io: Io, dash: *tui.Dashboard, snap: *const stats.Snapshot, elapsed_s: f64) !void {
+fn writeSummaryToStderr(io: Io, dash: *tui.Dashboard, snap: *const stats.Snapshot, run: report.Run) !void {
     var buf: [8192]u8 = undefined;
     // Streaming, not positional: stderr is shared with the interrupt notice, the
     // sink warnings and the SLO breach message, and a pwrite from byte 0 would
     // interleave with them instead of following them (see `writeAll`).
     var fw: Io.File.Writer = .initStreaming(.stderr(), io, &buf);
-    try dash.writeFinalSummary(&fw.interface, snap, elapsed_s);
+    try dash.writeFinalSummary(&fw.interface, snap, run);
     try fw.interface.flush();
 }
 

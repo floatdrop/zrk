@@ -16,6 +16,7 @@ const cli = @import("cli.zig");
 const hdr = @import("hdr.zig");
 const connection = @import("connection.zig");
 const stats = @import("stats.zig");
+const report = @import("report.zig");
 
 /// Live latency spectrogram geometry. The waterfall keeps the last
 /// `spec_rows_max` per-interval distributions (newest at the bottom), each
@@ -134,6 +135,17 @@ pub const Dashboard = struct {
     const Sample = struct { ns: i128, completed: u64, bytes: u64 };
     const rate_ring_len = 128;
 
+    /// The measurement a frame renders: throughput over `seconds` of run,
+    /// ending `at_s` into it. The four travel together because they only mean
+    /// anything together — `rate` next to an offered load sampled from a
+    /// different span is the comparison this panel exists to get right.
+    const Window = struct {
+        rate: f64 = 0,
+        bps: f64 = 0,
+        seconds: f64 = 0,
+        at_s: f64 = 0,
+    };
+
     pub fn init(io: Io, cfg: *const cli.Config, environ: std.process.Environ, buffer: []u8) Dashboard {
         const file = Io.File.stdout();
         const is_tty = file.isTty(io) catch false;
@@ -186,18 +198,22 @@ pub const Dashboard = struct {
         // window is thus independent of the redraw cadence; the first frames
         // fall back to the whole run so far (otherwise a run with a single
         // frame reports 0 despite traffic).
-        var rate: f64 = 0;
-        var bps: f64 = 0;
+        // The span matters as much as the rates: under a ramp the offered
+        // schedule moves *within* the window, so `offered` has to be averaged
+        // over the same span to be comparable.
+        var win: Window = .{ .seconds = elapsed_s, .at_s = elapsed_s };
         if (self.windowSample(now_ns)) |base| {
             const d_s: f64 = @as(f64, @floatFromInt(now_ns - base.ns)) / std.time.ns_per_s;
             if (d_s > 0) {
-                rate = @as(f64, @floatFromInt(snap.counters.completed -| base.completed)) / d_s;
-                bps = @as(f64, @floatFromInt(snap.counters.bytes -| base.bytes)) / d_s;
+                win.rate = @as(f64, @floatFromInt(snap.counters.completed -| base.completed)) / d_s;
+                win.bps = @as(f64, @floatFromInt(snap.counters.bytes -| base.bytes)) / d_s;
+                win.seconds = d_s;
             }
         } else if (elapsed_s > 0) {
-            rate = @as(f64, @floatFromInt(snap.counters.completed)) / elapsed_s;
-            bps = @as(f64, @floatFromInt(snap.counters.bytes)) / elapsed_s;
+            win.rate = @as(f64, @floatFromInt(snap.counters.completed)) / elapsed_s;
+            win.bps = @as(f64, @floatFromInt(snap.counters.bytes)) / elapsed_s;
         }
+        const rate = win.rate;
         self.samples[self.sample_count % rate_ring_len] = .{
             .ns = now_ns,
             .completed = snap.counters.completed,
@@ -219,11 +235,11 @@ pub const Dashboard = struct {
             // that rewraps old lines can leave artifacts for one frame; the
             // next repaint absorbs them.)
             self.term_cols = termWidth(self.file);
-            try self.repaint(w, snap, rate, bps, elapsed_s, total_s, false);
+            try self.repaint(w, snap, win, elapsed_s, total_s, false);
         } else {
             try w.print("[{d:6.1}s] {d:8.0} req/s {f}/s  p50={f} p99={f} p99.9={f} max={f}  errs={d}\n", .{
                 elapsed_s,                               rate,
-                Bytes.of(bps),                           Dur.of(snap.hist.valueAtPercentile(50)),
+                Bytes.of(win.bps),                       Dur.of(snap.hist.valueAtPercentile(50)),
                 Dur.of(snap.hist.valueAtPercentile(99)), Dur.of(snap.hist.valueAtPercentile(99.9)),
                 Dur.of(snap.hist.max()),                 snap.counters.socketErrors() + snap.counters.status_errors + snap.counters.deadline_errors,
             });
@@ -238,7 +254,7 @@ pub const Dashboard = struct {
     ///
     /// `term_cols` is the caller's to refresh: both call sites re-read it from
     /// the terminal first, which leaves tests free to pin a width.
-    fn repaint(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, rate: f64, bps: f64, elapsed_s: f64, total_s: f64, finished: bool) !void {
+    fn repaint(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, win: Window, elapsed_s: f64, total_s: f64, finished: bool) !void {
         try w.writeAll(sync_begin);
         // A frame that dies between the two sequences leaves the terminal
         // holding its display with nothing left to release it — that reads as a
@@ -250,7 +266,7 @@ pub const Dashboard = struct {
         // breaks these too, and there is no better move left either way.
         errdefer closeSync(w);
         if (self.prev_lines > 0) try w.print("\r\x1b[{d}A\x1b[J", .{self.prev_lines});
-        self.prev_lines = try self.drawPanel(w, snap, rate, bps, elapsed_s, total_s, finished);
+        self.prev_lines = try self.drawPanel(w, snap, win, elapsed_s, total_s, finished);
         try w.writeAll(sync_end);
     }
 
@@ -273,7 +289,7 @@ pub const Dashboard = struct {
     /// the next frame knows how far to repaint. Config the launching command
     /// already shows (URL, -c, a ramp's A:B) is not repeated here — it sits
     /// right above in scrollback.
-    fn drawPanel(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, rate: f64, bps: f64, elapsed_s: f64, total_s: f64, finished: bool) !usize {
+    fn drawPanel(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, win: Window, elapsed_s: f64, total_s: f64, finished: bool) !usize {
         const c = snap.counters;
         const k = self.colors;
         var lines: usize = 0;
@@ -287,17 +303,22 @@ pub const Dashboard = struct {
         const v_time = clock(&vbuf[0], elapsed_s);
         const v_total = clock(&vbuf[1], total_s);
 
-        // Offered load right now — for a ramp, the interpolated schedule.
-        // Meaningless in --closed mode, which has no offered rate to show.
-        const r0: f64 = @floatFromInt(self.cfg.rate);
-        const offered_now: f64 = if (self.cfg.rate_end) |e| blk: {
-            const frac = if (total_s > 0) @min(elapsed_s / total_s, 1.0) else 1.0;
-            break :blk r0 + (@as(f64, @floatFromInt(e)) - r0) * frac;
-        } else r0;
+        // Offered load over the same window `achieved` was measured over — the
+        // schedule at its midpoint, since the ramp is linear in time. Not the
+        // schedule *right now*: `achieved` is an average across the window, and
+        // a ramp climbs while the window runs, so comparing it to the instant's
+        // offered rate books every healthy ramp as half a window of slope
+        // behind. At -R100:1000 over 30s with a 1s window that is a standing 15
+        // req/s gap; over 4s it is 110, enough to paint a run that missed
+        // nothing red from start to finish. Anchored on `win.at_s` rather than
+        // `elapsed_s` because the final paint's window closed at the last
+        // progress row, which an interrupt can leave most of an --interval
+        // behind. Meaningless in --closed mode, which has no offered rate.
+        const offered_now = report.offeredRate(self.cfg, win.at_s - win.seconds / 2);
         const v_offered = std.fmt.bufPrint(&vbuf[2], "{d:.0} req/s", .{offered_now}) catch "?";
-        const v_achieved = std.fmt.bufPrint(&vbuf[3], "{d:.0} req/s", .{rate}) catch "?";
+        const v_achieved = std.fmt.bufPrint(&vbuf[3], "{d:.0} req/s", .{win.rate}) catch "?";
         const v_transfer = std.fmt.bufPrint(&vbuf[4], "{f} ({f}/s)", .{
-            Bytes.of(@floatFromInt(c.bytes)), Bytes.of(bps),
+            Bytes.of(@floatFromInt(c.bytes)), Bytes.of(win.bps),
         }) catch "?";
         const v_2xx = std.fmt.bufPrint(&vbuf[5], "{d}", .{c.status_class[2]}) catch "?";
 
@@ -305,7 +326,7 @@ pub const Dashboard = struct {
         // (rate_ratio / Little's law): paint the achieved rate red. Skip the
         // first seconds while the fleet is still connecting. Never applies in
         // --closed mode, which has no schedule to fall behind.
-        const behind = !self.cfg.closed and elapsed_s >= 2 and rate < 0.95 * offered_now;
+        const behind = !self.cfg.closed and elapsed_s >= 2 and win.rate < 0.95 * offered_now;
 
         // A fixed three-line status, all indented to `stat_col`: the clock
         // lives alone in the left gutter (above the pXX labels) so its widening
@@ -661,17 +682,30 @@ pub const Dashboard = struct {
     /// dot, then left on screen as the run's record — no separate summary. Without
     /// a TUI (--plain, a pipe, non-tty) a compact plain-text summary is printed
     /// instead. Aggregates should come from `Fleet.readFinal` (post-join).
-    pub fn final(self: *Dashboard, snap: *const stats.Snapshot, elapsed_s: f64) !void {
+    pub fn final(self: *Dashboard, snap: *const stats.Snapshot, run: report.Run) !void {
         const w = self.writer();
         if (self.tui) {
-            const c = snap.counters;
-            const rate: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.completed)) / elapsed_s else 0;
-            const bps: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.bytes)) / elapsed_s else 0;
+            const elapsed_s = run.elapsed_s;
             const total_s: f64 = @as(f64, @floatFromInt(self.cfg.duration_ns)) / std.time.ns_per_s;
             self.term_cols = termWidth(self.file);
-            try self.repaint(w, snap, rate, bps, elapsed_s, total_s, true);
+            // Every value keeps meaning what it meant in each live frame — the
+            // last window's — rather than switching to whole-run averages for
+            // this one paint. The panel sets `achieved` beside `offered`, and
+            // under a ramp the run average is half the offered rate by
+            // construction, so the swap painted a healthy `-R100:1000` run's
+            // last frame red for falling behind a schedule it had in fact kept.
+            // Transfer comes from the same window for the same reason: paired
+            // with a whole-run byte rate, the panel's own two numbers divide
+            // out to a bytes-per-request that was never true. The whole-run
+            // averages are the summary's `req/s`, where they are labelled.
+            try self.repaint(w, snap, .{
+                .rate = run.end_rate,
+                .bps = run.end_bytes_per_sec,
+                .seconds = run.end_window_s,
+                .at_s = run.end_window_at_s,
+            }, elapsed_s, total_s, true);
         } else {
-            try self.writeFinalSummary(w, snap, elapsed_s);
+            try self.writeFinalSummary(w, snap, run);
         }
         try self.fw.interface.flush();
     }
@@ -696,8 +730,9 @@ pub const Dashboard = struct {
     /// the `--output` file). No colors and no wrk2-style framing — just the totals
     /// the live panel would have shown, in the panel's own vocabulary. Does not
     /// flush. Aggregates should come from `Fleet.readFinal` (post-join).
-    pub fn writeFinalSummary(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, elapsed_s: f64) !void {
+    pub fn writeFinalSummary(self: *Dashboard, w: *Io.Writer, snap: *const stats.Snapshot, run: report.Run) !void {
         const c = snap.counters;
+        const elapsed_s = run.elapsed_s;
         const rps: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.completed)) / elapsed_s else 0;
         const bps: f64 = if (elapsed_s > 0) @as(f64, @floatFromInt(c.bytes)) / elapsed_s else 0;
 
@@ -706,6 +741,16 @@ pub const Dashboard = struct {
         try w.print(" read  ·  {d:.0} req/s  ·  ", .{rps});
         try writeBytes(w, bps);
         try w.writeAll("/s\n");
+        // The line above is `requests / duration`, which under a ramp is the
+        // midpoint of the offered range and nothing more: it reads the same
+        // whether the target held the end rate or fell over halfway up. So a
+        // ramp gets a second line with the number the ramp was run to find —
+        // the same one `--format json` reports as `achieved_rate`.
+        if (self.cfg.rate_end) |end| {
+            try w.print("  ramp {d} → {d} req/s  ·  {d:.0} req/s over the final {d:.1}s\n", .{
+                self.cfg.rate, end, run.end_rate, run.end_window_s,
+            });
+        }
 
         if (self.cfg.closed) {
             try w.writeAll("  latency (closed-loop round-trip)\n");
@@ -858,7 +903,7 @@ test "writeFinalSummary renders the compact plain summary to any writer" {
 
     var out = Io.Writer.Allocating.init(testing.allocator);
     defer out.deinit();
-    try dash.writeFinalSummary(&out.writer, &snap, 2.0);
+    try dash.writeFinalSummary(&out.writer, &snap, .{ .elapsed_s = 2.0, .launched = 1, .end_rate = 500, .end_window_s = 1.0 });
     const text = out.written();
 
     try testing.expect(std.mem.indexOf(u8, text, "latency (coordinated-omission corrected)") != null);
@@ -872,6 +917,84 @@ test "writeFinalSummary renders the compact plain summary to any writer" {
     // No deadline mode here, so neither overload line appears.
     try testing.expect(std.mem.indexOf(u8, text, "deadline misses") == null);
     try testing.expect(std.mem.indexOf(u8, text, "peak schedule lag") == null);
+    // Constant load: the average is the whole story, so no ramp line.
+    try testing.expect(std.mem.indexOf(u8, text, "ramp") == null);
+}
+
+test "a ramp's summary reports the rate it ended at, not just the average" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const cfg = cli.Config{
+        .rate = 100,
+        .rate_end = 1000,
+        .url = try cli.parseUrl("http://127.0.0.1:8080/"),
+    };
+    var dash_buf: [1024]u8 = undefined;
+    var dash = Dashboard.init(io, &cfg, .empty, &dash_buf);
+
+    var snap: stats.Snapshot = .{ .hist = try stats.newHistogram(testing.allocator), .counters = .{} };
+    defer snap.deinit();
+    snap.hist.record(1000);
+    snap.counters.completed = 5500; // 10s of a perfect 100->1000 ramp
+    snap.counters.recordStatus(200);
+
+    var out = Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+    try dash.writeFinalSummary(&out.writer, &snap, .{ .elapsed_s = 10.0, .launched = 8, .end_rate = 955, .end_window_s = 1.0 });
+    const text = out.written();
+
+    // The first line stays `requests / duration` — 550, the ramp's midpoint,
+    // which would read as a failure against a 1000 req/s target. The second
+    // line carries the tail, and says the ramp was in fact kept.
+    try testing.expect(std.mem.indexOf(u8, text, "5500 requests in 10.00s") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "550 req/s") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "ramp 100 \u{2192} 1000 req/s") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "955 req/s over the final 1.0s") != null);
+}
+
+test "a kept ramp is not painted as falling behind its schedule" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    // -R100:1000 over 4s: the schedule climbs 225 req/s every second, so the
+    // second ending at t=4 offers 887.5 on average while standing at 1000 the
+    // instant it closes. A client that served exactly 888 of them missed
+    // nothing — comparing it against the instant would call it 11% short and
+    // paint the panel red for a run that kept its schedule perfectly.
+    const cfg = cli.Config{
+        .rate = 100,
+        .rate_end = 1000,
+        .duration_ns = 4 * std.time.ns_per_s,
+        .url = try cli.parseUrl("http://127.0.0.1/"),
+    };
+    var dash_buf: [64]u8 = undefined;
+    var dash = Dashboard.init(io, &cfg, .empty, &dash_buf);
+    dash.colors = .enabled; // the red is the assertion, so force color on
+    dash.term_cols = 120;
+
+    var snap: stats.Snapshot = .{ .hist = try stats.newHistogram(testing.allocator), .counters = .{} };
+    defer snap.deinit();
+    snap.hist.record(1000);
+    snap.counters.completed = 2200;
+    snap.counters.recordStatus(200);
+
+    var kept = Io.Writer.Allocating.init(testing.allocator);
+    defer kept.deinit();
+    _ = try dash.drawPanel(&kept.writer, &snap, .{ .rate = 888, .bps = 1000, .seconds = 1.0, .at_s = 4.0 }, 4.0, 4.0, true);
+    // Both halves of the line read 888: the same window, measured two ways.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, kept.written(), "888 req/s"));
+    try testing.expect(std.mem.indexOf(u8, kept.written(), "offered ") != null);
+    try testing.expect(std.mem.indexOf(u8, kept.written(), "achieved ") != null);
+    try testing.expect(std.mem.indexOf(u8, kept.written(), Colors.enabled.red ++ "888 req/s") == null);
+
+    // A target that genuinely couldn't hold the top of the ramp still goes red.
+    var behind = Io.Writer.Allocating.init(testing.allocator);
+    defer behind.deinit();
+    _ = try dash.drawPanel(&behind.writer, &snap, .{ .rate = 400, .bps = 1000, .seconds = 1.0, .at_s = 4.0 }, 4.0, 4.0, true);
+    try testing.expect(std.mem.indexOf(u8, behind.written(), Colors.enabled.red ++ "400 req/s") != null);
 }
 
 test "a requested stop shows on the panel without breaking its line accounting" {
@@ -900,14 +1023,14 @@ test "a requested stop shows on the panel without breaking its line accounting" 
     // what the old stderr stop notice did, from outside the panel entirely.
     var running = Io.Writer.Allocating.init(testing.allocator);
     defer running.deinit();
-    const live = try dash.drawPanel(&running.writer, &snap, 100, 1000, 1.0, 30.0, false);
+    const live = try dash.drawPanel(&running.writer, &snap, .{ .rate = 100, .bps = 1000, .seconds = 1.0, .at_s = 1.0 }, 1.0, 30.0, false);
     try testing.expectEqual(std.mem.count(u8, running.written(), "\n"), live);
     try testing.expect(std.mem.indexOf(u8, running.written(), "✕") == null);
 
     stop.store(true, .monotonic);
     var stopping = Io.Writer.Allocating.init(testing.allocator);
     defer stopping.deinit();
-    const cut = try dash.drawPanel(&stopping.writer, &snap, 100, 1000, 1.0, 30.0, false);
+    const cut = try dash.drawPanel(&stopping.writer, &snap, .{ .rate = 100, .bps = 1000, .seconds = 1.0, .at_s = 1.0 }, 1.0, 30.0, false);
     try testing.expectEqual(std.mem.count(u8, stopping.written(), "\n"), cut);
     // The recording dot gives way to a cross, and the notice lands inside the
     // panel — one line taller than the same frame with no stop pending.
@@ -920,7 +1043,7 @@ test "a requested stop shows on the panel without breaking its line accounting" 
     // the hint gives way to what the numbers mean.
     var final_out = Io.Writer.Allocating.init(testing.allocator);
     defer final_out.deinit();
-    const done = try dash.drawPanel(&final_out.writer, &snap, 100, 1000, 1.0, 30.0, true);
+    const done = try dash.drawPanel(&final_out.writer, &snap, .{ .rate = 100, .bps = 1000, .seconds = 1.0, .at_s = 1.0 }, 1.0, 30.0, true);
     try testing.expectEqual(std.mem.count(u8, final_out.written(), "\n"), done);
     try testing.expect(std.mem.indexOf(u8, final_out.written(), "✕") != null);
     try testing.expect(std.mem.indexOf(u8, final_out.written(), "signal again") == null);
@@ -946,7 +1069,7 @@ test "a live repaint is bracketed by exactly one synchronized update" {
 
     var first = Io.Writer.Allocating.init(testing.allocator);
     defer first.deinit();
-    try dash.repaint(&first.writer, &snap, 100, 1000, 1.0, 30.0, false);
+    try dash.repaint(&first.writer, &snap, .{ .rate = 100, .bps = 1000, .seconds = 1.0, .at_s = 1.0 }, 1.0, 30.0, false);
     const f = first.written();
 
     // The whole frame sits inside the update: opened before anything is drawn
@@ -968,7 +1091,7 @@ test "a live repaint is bracketed by exactly one synchronized update" {
     var second = Io.Writer.Allocating.init(testing.allocator);
     defer second.deinit();
     const before = dash.prev_lines;
-    try dash.repaint(&second.writer, &snap, 100, 1000, 2.0, 30.0, false);
+    try dash.repaint(&second.writer, &snap, .{ .rate = 100, .bps = 1000, .seconds = 1.0, .at_s = 2.0 }, 2.0, 30.0, false);
     const g = second.written();
 
     var cursor_up_buf: [16]u8 = undefined;
@@ -1186,7 +1309,7 @@ test "writeFinalSummary surfaces deadline misses and peak schedule lag" {
 
     var out = Io.Writer.Allocating.init(testing.allocator);
     defer out.deinit();
-    try dash.writeFinalSummary(&out.writer, &snap, 2.0);
+    try dash.writeFinalSummary(&out.writer, &snap, .{ .elapsed_s = 2.0, .launched = 1, .end_rate = 500, .end_window_s = 1.0 });
     const text = out.written();
 
     try testing.expect(std.mem.indexOf(u8, text, "deadline misses: 42") != null);

@@ -9,13 +9,17 @@ summary object (the live dashboard is suppressed) to stdout or `--output <file>`
 {
   "zrk_version": "0.1.0",
   "target": { "url": "http://127.0.0.1:8080/", "method": "GET" },
-  "config": { "connections": 50, "launched": 50, "duration_s": 20.000, "closed": false, "disable_keepalive": false, "target_rate": 1000, "timeout_ms": 2000, "deadline_ms": 0, "deadline_abort": false, "record_timeouts": true },
+  "config": { "connections": 50, "launched": 50, "duration_s": 20.000, "interval_s": 1.000, "closed": false, "disable_keepalive": false, "target_rate": 1000, "target_rate_end": 1000, "timeout_ms": 2000, "deadline_ms": 0, "deadline_abort": false, "record_timeouts": true },
   "duration_s": 20.002,
   "requests": 19998,
   "bytes": 1239876,
   "achieved_rate": 999.80,
   "target_rate": 1000,
+  "target_rate_end": 1000,
   "rate_ratio": 0.9998,
+  "achieved_rate_end": 999.91,
+  "rate_ratio_end": 0.9999,
+  "end_window_s": 1.000,
   "bytes_per_sec": 61987.30,
   "error_rate": 0.000000,
   "max_schedule_lag_us": 84,
@@ -37,12 +41,63 @@ many runs into one aggregate — none of which the summarized percentiles allow.
 `achieved_rate` / `rate_ratio` tell you whether the client actually sustained
 the target load. **If `rate_ratio` is well below 1.0, the client was saturated
 (one request in flight per connection) and the latency numbers reflect client
-backpressure, not the server: increase `-c`.**
+backpressure, not the server: increase `-c`.** For a ramp, that same pair reads
+as "how far up the ramp did the target actually get" — see below.
 
-Under `--closed` (`config.closed: true`), there's no offered rate to compare
-against, so `target_rate` mirrors `achieved_rate` and `rate_ratio` is always
-1.0 — a consumer that doesn't special-case `--closed` still gets coherent
-numbers instead of the unrelated default `-R`.
+### Constant load vs. a ramp
+
+Under **constant** load `achieved_rate` is the whole run averaged —
+`requests / duration_s` — and `rate_ratio` holds it against `-R`.
+
+Under a **ramp** (`-R A:B`) that average is the midpoint of the offered range
+and describes no part of the run: `-R100:1000` reports ~550 whether the server
+held 1000 all the way up or fell over at 200. So a ramp's `achieved_rate` is its
+**tail** instead — the rate served over the last `end_window_s` (one
+`config.interval_s`, give or take), which is the max sustained rate the ramp was
+run to find. `bytes_per_sec` covers the same window, so the two stay
+proportional. The whole-run average is still `requests / duration_s` if you want
+it.
+
+`rate_ratio` divides by the load *offered during that same window*, never by
+`target_rate_end`. `achieved_rate` is an average across a window in which the
+ramp keeps climbing, while `target_rate_end` is the schedule's value at the
+final instant; dividing one by the other would book a perfectly kept ramp as
+short by half a window of slope. A ramp that kept its schedule to the top
+reports `rate_ratio` ~1.0; one that saturated reports the fraction it managed.
+
+| field | what it is |
+| --- | --- |
+| `achieved_rate` | the run's throughput: the tail under a ramp, the whole-run average otherwise |
+| `rate_ratio` | `achieved_rate` over the load offered across the same span |
+| `achieved_rate_end` | **always** the tail, so a harness can read one key without knowing whether a ramp was configured |
+| `rate_ratio_end` | `achieved_rate_end` over the load offered during that window |
+| `target_rate_end` | the offered rate the ramp climbed to (`B`), or `target_rate` for constant load |
+| `end_window_s` | how long the tail window was |
+
+Under a ramp the `*_end` pair is identical to the top-level pair. Under constant
+load it is the last window rather than the whole run — which is how a server
+that degraded partway through a run shows up at all. It is normally the number
+the last `--timeseries` row reports, available without asking for the series —
+but don't assert equality: a duration that isn't a whole number of intervals
+ends on a sliver of a row that zrk deliberately reaches past, and an interrupted
+run raises no row at the signal at all. A run shorter than a single window has
+no tail to measure and falls back to the whole-run average.
+
+`end_window_s` is the window's length, and it closes at the last progress row —
+which on an interrupted run can be most of an `--interval` before `duration_s`.
+Both ratios account for that, so a ramp cut short by Ctrl-C is still judged
+against the load offered where its window actually sat.
+
+Under `--closed` (`config.closed: true`) there is no offered rate to compare
+against, and `--closed` cannot ramp, so `achieved_rate` is the whole-run
+average, `target_rate` mirrors it, `target_rate_end` mirrors
+`achieved_rate_end`, and both ratios are always 1.0 — a consumer that doesn't
+special-case `--closed` still gets coherent numbers instead of the unrelated
+default `-R`.
+
+Note that `config.target_rate` / `config.target_rate_end` are the `-R` endpoints
+**as given** (equal for a constant run), while the top-level pair is the
+*offered schedule*, which `--closed` redefines as above.
 
 Timed-out requests are recorded into the latency histogram by default (as a
 coordinated-omission-corrected sample) so the tail isn't silently truncated;
@@ -58,7 +113,9 @@ and format-compatible with wrk2's `--latency` output.
 ## `--timeseries` — per-interval NDJSON
 
 `--timeseries <file>` streams one NDJSON object per `--interval`, each carrying
-that window's offered `target_rate`, `achieved_rate`, request/error counts,
+that window's offered `target_rate` (the ramp's schedule averaged *across* the
+window, so it is directly comparable to the `achieved_rate` beside it rather
+than sitting half a window of slope above it), `achieved_rate`, request/error counts,
 transfer (`bytes`, `bytes_per_sec`), the backlog gauge, and a delta-histogram
 latency percentile set:
 
@@ -69,7 +126,10 @@ latency percentile set:
 This is the artifact a **ramp** (`-R A:B`) exists to produce: a curve of latency
 against offered load, so you can find the rate at which the server's tail breaks
 down. (The final summary's aggregate percentiles blend the whole ramp together,
-so they're less useful for a ramp than the time series is.)
+so they're less useful for a ramp than the time series is. Its throughput is not
+blended, though: the summary's `achieved_rate` is this file's last
+`achieved_rate`, so a harness that only wants the rate the ramp reached does not
+need the series at all.)
 
 Every count in a row is that **interval's** delta, so the rows sum to the run.
 `errors_by_kind` splits the `errors` scalar the same way the final summary's
