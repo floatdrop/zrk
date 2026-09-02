@@ -163,9 +163,12 @@ pub const Error = error{
 /// What stays behind this seam is everything that needs connection-scoped state
 /// to decide: field-block assembly, HPACK, the peer's settings, flow control.
 pub const Incoming = union(enum) {
-    /// A complete field block ended on `stream`, carrying this `:status`.
-    /// `bytes` is the block's own size, counted like any other response octets.
-    headers: struct { stream: u31, status: u16, bytes: u64, end_stream: bool },
+    /// A complete field block ended on `stream`. `status` is its `:status`, or
+    /// null for a block that carries none — a trailers section (RFC 9113
+    /// section 8.1), which is legal and routine for gRPC and for any response
+    /// declaring `Trailer`. `bytes` is the block's own size, counted like any
+    /// other response octets.
+    headers: struct { stream: u31, status: ?u16, bytes: u64, end_stream: bool },
     /// DATA arrived on `stream`.
     data: struct { stream: u31, bytes: u64, end_stream: bool },
     /// The peer reset `stream` (section 6.4). That stream is over; the
@@ -413,8 +416,13 @@ pub const Session = struct {
             switch (try session.receive()) {
                 .headers => |head| {
                     if (head.stream != stream) continue;
-                    if (status != null) return error.Protocol; // trailers carry no status
-                    status = head.status;
+                    if (head.status) |code| {
+                        // Two blocks each carrying a `:status` is malformed
+                        // (RFC 9113 section 8.3.2). A second block *without*
+                        // one is trailers, and just adds its octets.
+                        if (status != null) return error.Protocol;
+                        status = code;
+                    }
                     bytes += head.bytes;
                     if (head.end_stream) return finish(status, bytes);
                 },
@@ -658,11 +666,16 @@ fn finish(status: ?u16, bytes: u64) Error!httpmod.Response {
 /// Pull one field block's `:status` out, and check the rest is a well-formed
 /// response while we are already walking it.
 ///
+/// Null when the block has no `:status`. That is not an error here: a response
+/// may end with a trailers section, which carries no pseudo-headers at all.
+/// Whether a *first* block without one is malformed is the caller's to decide,
+/// and `finish` is where it is decided.
+///
 /// The validation is not ceremony: `h2.fields` is the package's answer to RFC
 /// 9113 section 8.2, and a load generator that reported a 200 for a response
 /// carrying a CR in a header value would be reporting a success the target
 /// should have been failed for.
-fn decodeStatus(decoder: *hpack.Decoder, buffer: []u8, block: []const u8) Error!u16 {
+fn decodeStatus(decoder: *hpack.Decoder, buffer: []u8, block: []const u8) Error!?u16 {
     var validator: h2.fields.MessageValidator = .init(.{
         .kind = .response,
         // The floor of section 8.2.1 rather than RFC 9110's full grammar. zrk
@@ -681,8 +694,14 @@ fn decodeStatus(decoder: *hpack.Decoder, buffer: []u8, block: []const u8) Error!
         if (status != null) return error.Protocol;
         status = std.fmt.parseInt(u16, field.value, 10) catch return error.Protocol;
     }
+    // No `:status` means this is a trailer section (section 8.3), and the
+    // response validator's one closing rule is that a response must have one.
+    // Every per-field rule it applied above holds for a trailer section too —
+    // section 8.3 constrains it further, not less — so stopping short of
+    // `finish` here validates exactly what `Kind.trailer` would.
+    if (status == null) return null;
     validator.finish() catch return error.Protocol;
-    return status orelse error.Protocol;
+    return status;
 }
 
 /// Read the nine octets of a frame header and check what they alone decide.

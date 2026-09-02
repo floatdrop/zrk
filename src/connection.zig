@@ -633,11 +633,48 @@ const Mux = struct {
     no_new_streams: bool = false,
     /// The connection is finished, for any reason.
     dead: bool = false,
+    /// What the peer is owed but has not been sent yet. Touched only by the
+    /// receiver, so they need no lock. See `flushOwed`.
+    owed_settings_ack: bool = false,
+    owed_ping: ?h2conn.Reply = null,
+
     /// Being retired on our own terms — end of run, or a drained GOAWAY.
     /// Streams still open then are dropped rather than counted: their requests
     /// went out but the run stopped waiting, which is not a target failure. The
     /// same judgement `noteError` makes about everything after `stop`.
     retiring: bool = false,
+
+    /// Send whatever the peer is owed — SETTINGS and PING acks, and the
+    /// connection window — if the writer happens to be free. False on a write
+    /// that broke.
+    ///
+    /// Never waits for the writer, and that is the point. The sender holds
+    /// `write` across its flush, and a flush can park when the peer stops
+    /// reading. If the receiver then waited for `write`, it would stop reading
+    /// too — so the peer's send buffer fills, the peer stops reading, and the
+    /// sender's flush never returns. The cycle closes and the connection hangs
+    /// until teardown turns the rest of the run into timeouts. Reading is the
+    /// only way out of it, so the receiver gives up the writer instead of the
+    /// read and tries again after the next frame.
+    fn flushOwed(mux: *Mux) bool {
+        const window_due = mux.session.windowDue();
+        if (!mux.owed_settings_ack and mux.owed_ping == null and !window_due) return true;
+        if (!mux.write.tryLock()) return true;
+        defer mux.write.unlock(mux.io);
+
+        if (mux.owed_settings_ack) {
+            mux.session.reply(.settings_ack) catch return false;
+            mux.owed_settings_ack = false;
+        }
+        if (mux.owed_ping) |owed| {
+            mux.session.reply(owed) catch return false;
+            mux.owed_ping = null;
+        }
+        // Re-read rather than trusting `window_due`: a frame may have landed
+        // while the lock was being taken.
+        if (mux.session.windowDue()) mux.session.replenishWindow() catch return false;
+        return true;
+    }
 
     /// Take a free slot, waiting if every stream is busy. Null means the sender
     /// is done: the connection died, the peer said no new streams, or the wait
@@ -658,7 +695,14 @@ const Mux = struct {
     }
 
     /// Free a slot and wake a sender waiting for one. Caller holds `state`.
+    ///
+    /// Idempotent, and that is load-bearing rather than defensive: a connection
+    /// that dies while the sender is mid-`send` has its slot reclaimed by
+    /// `fail` — the sender is parked inside `beginStream`'s flush at the time —
+    /// and the sender then runs its own error path over the same slot. Without
+    /// the guard the second call takes `active` below zero.
     fn release(mux: *Mux, slot: *Slot) void {
+        if (!slot.busy) return;
         slot.* = .{};
         mux.active -= 1;
         mux.slot_free.signal(mux.io);
@@ -712,8 +756,12 @@ const Mux = struct {
         if (!mux.retiring) {
             for (mux.slots) |*slot| {
                 if (!slot.busy) continue;
+                // A slot claimed but not yet opened carries no request: the
+                // sender has it and has written nothing, so freeing it is right
+                // and charging it an error would invent a failure.
+                const carried = slot.stream != 0;
                 mux.release(slot);
-                noteError(mux.p, kind);
+                if (carried) noteError(mux.p, kind);
             }
         }
         mux.dead = true;
@@ -759,9 +807,14 @@ const Mux = struct {
         defer mux.write.unlock(io);
 
         const sent = now(io);
-        {
+        const stream = blk: {
             mux.state.lockUncancelable(io);
             defer mux.state.unlock(io);
+            // The connection can die between acquiring this slot and reaching
+            // here — `shed` yields, and `fail` reclaims every open slot. Then
+            // this slot is somebody else's (or nobody's) and must not be
+            // written into.
+            if (!slot.busy or mux.dead) break :blk 0;
             slot.stream = mux.session.peekStream();
             // Both bounds are absolute timestamps — the wire timeout from the
             // actual send, the CO abort from `scheduled` — so the earlier one
@@ -776,18 +829,27 @@ const Mux = struct {
                 0;
             slot.deadline_co = co != 0 and (wire == 0 or co <= wire);
             slot.deadline_ns = if (slot.deadline_co) co else wire;
-        }
+            break :blk slot.stream;
+        };
+        // Nothing was sent and no index was consumed, so the schedule simply
+        // resumes here on the next connection.
+        if (stream == 0) return false;
 
         send_index.* += 1;
 
         _ = mux.session.beginStream(p.request_block, p.body) catch |err| {
             mux.state.lockUncancelable(io);
             defer mux.state.unlock(io);
-            // The stream never opened, so nothing will ever close it. A refusal
-            // to open one (GOAWAY, or identifiers exhausted) sent no request
-            // and is not a failure to report; a write that broke is.
-            mux.release(slot);
-            if (err != error.Closed and !mux.retiring) noteError(p, .write);
+            // The stream never opened, so nothing will ever close it — unless
+            // `fail` already reclaimed the slot while this write was parked, in
+            // which case the request has been charged once already and charging
+            // it again would double-count one send as two errors.
+            if (slot.busy and slot.stream == stream) {
+                // A refusal to open (GOAWAY, or identifiers exhausted) sent no
+                // request and is not a failure to report; a broken write is.
+                mux.release(slot);
+                if (err != error.Closed and !mux.retiring) noteError(p, .write);
+            }
             mux.dead = true;
             mux.slot_free.broadcast(io);
             return false;
@@ -937,13 +999,13 @@ fn muxReceive(mux: *Mux) void {
                 resetOneSlot(mux, stream);
                 break :blk true;
             },
+            // Recorded, not sent: `flushOwed` below decides whether the
+            // writer can be had without stalling the read.
             .reply => |owed| blk: {
-                mux.write.lockUncancelable(io);
-                defer mux.write.unlock(io);
-                session.reply(owed) catch {
-                    mux.fail(.write);
-                    return;
-                };
+                switch (owed) {
+                    .settings_ack => mux.owed_settings_ack = true,
+                    .ping_ack => mux.owed_ping = owed,
+                }
                 break :blk false;
             },
             // Open streams may still finish; the sender stops opening new ones.
@@ -958,15 +1020,12 @@ fn muxReceive(mux: *Mux) void {
         };
         idle_frames = if (progressed) 0 else idle_frames + 1;
 
-        // Give the connection window back before the budget runs out. Outside
-        // the state lock, and outside the read that produced the debt.
-        if (session.windowDue()) {
-            mux.write.lockUncancelable(io);
-            defer mux.write.unlock(io);
-            session.replenishWindow() catch {
-                mux.fail(.write);
-                return;
-            };
+        // Acks the peer is waiting on, and the connection window before its
+        // budget runs out. Outside the state lock, and outside the read that
+        // produced the debt.
+        if (!mux.flushOwed()) {
+            mux.fail(.write);
+            return;
         }
     }
     mux.fail(.read);
@@ -986,8 +1045,18 @@ fn muxWatch(mux: *Mux) void {
 
     // How long to wait before re-checking with nothing on the wire. A quarter
     // of the shortest bound this watcher can be asked to enforce, so an idle
-    // stretch can never oversleep a deadline armed just after it began.
-    const bound = if (p.timeout_ns != 0) p.timeout_ns else p.deadline_ns;
+    // stretch can never oversleep a deadline armed just after it began. Taking
+    // the wire timeout alone would not do: `--timeout 30s --deadline 100ms
+    // --deadline-abort` would idle for 7.5 s and overshoot the bound it is
+    // there to hold by seventy-five times.
+    const wire_bound = p.timeout_ns;
+    const co_bound = if (p.deadline_abort) p.deadline_ns else 0;
+    const bound = if (wire_bound != 0 and co_bound != 0)
+        @min(wire_bound, co_bound)
+    else if (wire_bound != 0)
+        wire_bound
+    else
+        co_bound;
     const idle_slice_ns: u64 = @max(bound / 4, std.time.ns_per_ms);
 
     var expired: [streams_max]u31 = undefined;
@@ -1046,15 +1115,24 @@ fn muxWatch(mux: *Mux) void {
     }
 }
 
-/// Fold one frame into the stream it belongs to. Returns whether it finished a
-/// request, which is what `muxReceive`'s no-progress bound counts.
+/// Fold one frame into the stream it belongs to. Returns whether it belonged to
+/// a stream still open, which is what `muxReceive`'s no-progress bound counts.
+///
+/// Belonging, not finishing. A 16 KiB-framed response of any size is hundreds
+/// of DATA frames that end nothing, and counting only completions would make
+/// the bound scale as 1/depth: at `-s 8`, eight interleaved multi-megabyte
+/// responses reach it before any of them ends, and a healthy connection would
+/// be killed for being busy. What the bound is actually for is a peer that
+/// sends endlessly and delivers nothing — SETTINGS, PING, frames for streams
+/// long retired — and none of those land in a slot.
 fn deliverToSlot(mux: *Mux, stream: u31, status: ?u16, bytes: u64, end_stream: bool) bool {
     mux.state.lockUncancelable(mux.io);
     defer mux.state.unlock(mux.io);
     const slot = mux.find(stream) orelse return false;
     if (status) |code| {
-        // A second field block on a stream that already has a status is
-        // trailers, and trailers carry none (RFC 9113 section 8.1).
+        // Two blocks each carrying a `:status` is malformed (RFC 9113 section
+        // 8.3.2): one stream's request is lost, and only that one — the
+        // connection and every other stream on it are fine.
         if (slot.status != null) {
             mux.release(slot);
             noteError(mux.p, .read);
@@ -1063,8 +1141,7 @@ fn deliverToSlot(mux: *Mux, stream: u31, status: ?u16, bytes: u64, end_stream: b
         slot.status = code;
     }
     slot.bytes += bytes;
-    if (!end_stream) return false;
-    mux.complete(slot);
+    if (end_stream) mux.complete(slot);
     return true;
 }
 
@@ -1687,6 +1764,192 @@ test "a stalled stream is reset alone, leaving the other samples intact" {
     // `record_timeouts` is on by default, so the abandoned request is a sample
     // too; every other completion is one, and nothing else is.
     try testing.expectEqual(counters.completed + counters.timeouts, histogram.count());
+}
+
+/// An h2c server that ends every response with a trailers section.
+///
+/// Legal (RFC 9113 section 8.1) and routine — gRPC does nothing else — and the
+/// shape that used to be fatal: a second field block carries no `:status`, so
+/// decoding one as though it must have failed the whole connection and took
+/// every other in-flight stream's sample with it.
+fn h2TrailerServe(io: Io, server: *net.Server) void {
+    var stream = server.accept(io) catch return;
+    defer stream.close(io);
+    disableNagle(stream);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var wbuf: [16 * 1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var w = stream.writer(io, &wbuf);
+    const reader = &r.interface;
+    const writer = &w.interface;
+    if (!h2Greet(reader, writer)) return;
+
+    var block_buf: [64]u8 = undefined;
+    const block = h2ResponseBlock(&block_buf);
+
+    var trailer_buf: [64]u8 = undefined;
+    var storage: h2.hpack.Encoder.Storage(0) = .{};
+    var encoder = storage.encoder(.static_only);
+    const encoded = encoder.encode(&trailer_buf, &.{
+        .{ .name = "grpc-status", .value = "0" },
+    });
+    const trailers = trailer_buf[0..encoded.written];
+
+    while (true) {
+        const octets = reader.take(h2.frame.Header.octets) catch return;
+        const header = h2.frame.Header.parse(octets) catch return;
+        if (header.length > 0) _ = reader.take(header.length) catch return;
+
+        switch (header.frame_type) {
+            .settings => if (!header.has(.ack)) {
+                writeTestFrame(writer, .settings, h2.frame.Flag.ack.bit(), 0, &.{}) catch return;
+                writer.flush() catch return;
+            },
+            .headers => {
+                const id = header.stream_identifier;
+                const end_headers = h2.frame.Flag.end_headers.bit();
+                writeTestFrame(writer, .headers, end_headers, id, block) catch return;
+                writeTestFrame(writer, .data, 0, id, "hi") catch return;
+                // The trailers section, ending the stream.
+                writeTestFrame(
+                    writer,
+                    .headers,
+                    end_headers | h2.frame.Flag.end_stream.bit(),
+                    id,
+                    trailers,
+                ) catch return;
+                writer.flush() catch return;
+            },
+            else => {},
+        }
+    }
+}
+
+test "a response ending in trailers completes, and takes no other stream down" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    var group: Io.Group = .init;
+    group.async(io, h2TrailerServe, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    var cfg: cli.Config = .{ .http2 = true };
+    cfg.url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = "/" };
+    const block = try httpmod.buildRequestBlock(testing.allocator, &cfg);
+    defer testing.allocator.free(block);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(200));
+    var params = muxParams(io, server_addr, block, 4, end, 50 * std.time.ns_per_ms, &stop, &histogram, &counters);
+    run(&params);
+
+    group.await(io) catch {};
+    server.deinit(io);
+
+    // Trailers end the stream normally: the status from the first block stands.
+    try testing.expect(counters.completed > 5);
+    try testing.expectEqual(counters.completed, counters.status_class[2]);
+    try testing.expectEqual(@as(u64, 0), counters.read_errors);
+    try testing.expectEqual(@as(u64, 0), counters.status_errors);
+    try testing.expectEqual(@as(u64, 0), counters.timeouts);
+    try testing.expectEqual(counters.completed, histogram.count());
+}
+
+/// An h2c server that answers a dozen requests and then drops the connection,
+/// serving one connection and returning.
+///
+/// Kills a connection with several streams open and the sender very likely
+/// parked inside a write, so the receiver's teardown and the sender's own error
+/// path race over the same slot. Getting that wrong takes `active` below zero
+/// (a panic under ReleaseSafe) or charges one send as two errors.
+///
+/// One connection and then return, rather than an accept loop: a coroutine
+/// parked in `accept` has to be cancelled to be joined, and a test that has to
+/// cancel its own server is a test that hangs when cancellation does not reach
+/// that far.
+fn h2DropServe(io: Io, server: *net.Server) void {
+    var stream = server.accept(io) catch return;
+    defer stream.close(io);
+    disableNagle(stream);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var wbuf: [16 * 1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var w = stream.writer(io, &wbuf);
+    const reader = &r.interface;
+    const writer = &w.interface;
+    if (!h2Greet(reader, writer)) return;
+
+    var block_buf: [64]u8 = undefined;
+    const block = h2ResponseBlock(&block_buf);
+
+    var served: u32 = 0;
+    while (served < 12) {
+        const octets = reader.take(h2.frame.Header.octets) catch return;
+        const header = h2.frame.Header.parse(octets) catch return;
+        if (header.length > 0) _ = reader.take(header.length) catch return;
+        switch (header.frame_type) {
+            .settings => if (!header.has(.ack)) {
+                writeTestFrame(writer, .settings, h2.frame.Flag.ack.bit(), 0, &.{}) catch return;
+                writer.flush() catch return;
+            },
+            .headers => {
+                if (!h2Answer(writer, block, header.stream_identifier)) return;
+                served += 1;
+            },
+            else => {},
+        }
+    }
+}
+
+test "a connection dying with streams open charges each request once" {
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    var group: Io.Group = .init;
+    group.async(io, h2DropServe, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    var cfg: cli.Config = .{ .http2 = true };
+    cfg.url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = "/" };
+    const block = try httpmod.buildRequestBlock(testing.allocator, &cfg);
+    defer testing.allocator.free(block);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(250));
+    var params = muxParams(io, server_addr, block, 8, end, 40 * std.time.ns_per_ms, &stop, &histogram, &counters);
+    run(&params);
+
+    group.await(io) catch {};
+    server.deinit(io);
+
+    // Reaching here at all is most of the assertion: releasing one slot twice
+    // takes `active` below zero, which panics under ReleaseSafe.
+    try testing.expect(counters.completed > 0);
+    try testing.expectEqual(counters.completed + counters.timeouts, histogram.count());
+    // The drop strands whatever was open, and each stranded request is charged
+    // once. More read errors than the connection could hold streams would mean
+    // the receiver and the sender both charged the same send.
+    try testing.expect(counters.read_errors <= 8);
 }
 
 test "streams leave the offered load alone" {
