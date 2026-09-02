@@ -172,9 +172,10 @@ pub fn writeJson(
     // window `achieved_rate_end` is measured over.
     try w.writeAll("  \"config\": {");
     try w.print(
-        " \"connections\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"interval_s\": {d:.3}, \"closed\": {}, \"disable_keepalive\": {}, \"target_rate\": {d}, \"target_rate_end\": {d}, \"timeout_ms\": {d}, \"deadline_ms\": {d}, \"deadline_abort\": {}, \"record_timeouts\": {} }},\n",
+        " \"connections\": {d}, \"streams\": {d}, \"launched\": {d}, \"duration_s\": {d:.3}, \"interval_s\": {d:.3}, \"closed\": {}, \"disable_keepalive\": {}, \"target_rate\": {d}, \"target_rate_end\": {d}, \"timeout_ms\": {d}, \"deadline_ms\": {d}, \"deadline_abort\": {}, \"record_timeouts\": {} }},\n",
         .{
             cfg.connections,
+            cfg.streams,
             run.launched,
             @as(f64, @floatFromInt(cfg.duration_ns)) / std.time.ns_per_s,
             @as(f64, @floatFromInt(cfg.interval_ns)) / std.time.ns_per_s,
