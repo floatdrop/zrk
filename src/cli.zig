@@ -7,6 +7,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+// For `streams_max` only: the `--streams` ceiling is a property of the slot
+// table that lives on a connection's frame, so it is declared where that table
+// is rather than restated here.
+const connection = @import("connection.zig");
+
 /// zrk version string, surfaced by `--version` and embedded in JSON reports.
 /// Single-sourced from build.zig.zon via the build's options module.
 pub const version: []const u8 = @import("build_info").version;
@@ -112,12 +117,19 @@ pub const Config = struct {
     /// declines `h2` fails the connection rather than being benchmarked over a
     /// protocol nobody asked for.
     ///
-    /// One request is in flight per connection either way, so `-c`, the pacing,
-    /// and every latency number keep exactly their HTTP/1.1 meaning; only the
-    /// wire format changes. Multiplexing is a separate question about what
-    /// concurrency means for a coordinated-omission-corrected generator
-    /// (zoxy-io/zrk#21).
+    /// One request is in flight per connection unless `--streams` says
+    /// otherwise, so `-c`, the pacing, and every latency number keep exactly
+    /// their HTTP/1.1 meaning; only the wire format changes.
     http2: bool = false,
+    /// How many of a connection's scheduled sends may be on the wire at once
+    /// (`-s/--streams`). Requires `--http2`.
+    ///
+    /// A depth knob, not a second concurrency dial: `-c` still divides `-R`,
+    /// and `-c 10 -s 10` is deliberately *not* `-c 100` — same offered rate,
+    /// ten times the per-connection rate. What it removes is the client's own
+    /// serialisation, so a connection can hold its schedule instead of waiting
+    /// out each response. See docs/multiplexing.md.
+    streams: u32 = 1,
     /// Skip TLS certificate verification.
     insecure: bool = false,
     /// Emit append-only text lines instead of a redrawing TUI (for CI/pipes).
@@ -178,6 +190,9 @@ pub const ParseError = error{
     ClosedWithRamp,
     ClosedWithDeadline,
     KeepaliveWithHttp2,
+    ZeroStreams,
+    StreamsWithoutHttp2,
+    TooManyStreams,
     OutOfMemory,
 };
 
@@ -207,6 +222,11 @@ pub const usage =
     \\Options:
     \\  -t, --threads     <N>     Total number of threads to execute load (default 2)
     \\  -c, --connections <N>     Total connections to keep open (default 10)
+    \\  -s, --streams     <N>     HTTP/2 streams in flight per connection
+    \\                            (default 1). A depth knob only: -R still
+    \\                            splits across -c, so -c 10 -s 10 offers the
+    \\                            same rate as -c 10, not as -c 100. Requires
+    \\                            --http2
     \\  -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
     \\  -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps
     \\                            linearly from A to B over the run (default 1000)
@@ -270,7 +290,7 @@ pub const usage =
 ;
 
 /// Short options that take a value, so `-c100` can be split into `-c 100`.
-const value_short_opts = "tcdRHmbo";
+const value_short_opts = "tcsdRHmbo";
 
 /// Parse argv (excluding the program name). Header slices and the header array
 /// are allocated from `arena`; string values point into `args` (borrowed).
@@ -334,6 +354,8 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
             cfg.max_error_rate = try parseErrorRate(try nextValue(tokens, &i));
         } else if (eq(arg, "-t") or eq(arg, "--threads")) {
             cfg.threads = try parseU8(try nextValue(tokens, &i));
+        } else if (eq(arg, "-s") or eq(arg, "--streams")) {
+            cfg.streams = try parseU32(try nextValue(tokens, &i));
         } else if (eq(arg, "-c") or eq(arg, "--connections")) {
             cfg.connections = try parseU32(try nextValue(tokens, &i));
         } else if (eq(arg, "-d") or eq(arg, "--duration")) {
@@ -399,6 +421,15 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
     // `buildRequestBlock` omits it), and one stream per connection would
     // measure the handshake rather than the protocol.
     if (cfg.disable_keepalive and cfg.http2) return error.KeepaliveWithHttp2;
+    if (cfg.streams == 0) return error.ZeroStreams;
+    // HTTP/1.1 has no second stream to open. h2load spends `-m` on pipelining
+    // there; zrk will not, because a pipelined depth cannot be aborted per
+    // request — a timeout on one request abandons the whole pipeline behind
+    // it, which is the very thing `--streams` exists to avoid.
+    if (cfg.streams > 1 and !cfg.http2) return error.StreamsWithoutHttp2;
+    // The slot table lives on the connection's own frame; see
+    // `connection.streams_max`.
+    if (cfg.streams > connection.streams_max) return error.TooManyStreams;
 
     const raw_url = url_arg orelse return error.MissingUrl;
     cfg.url = try parseUrl(raw_url);
@@ -640,6 +671,46 @@ test "closed flag parses; rejects ramp and deadline" {
     // not rejected) since a scalar -R can't be told apart from the default.
     const with_rate = (try parse(a, &[_][]const u8{ "--closed", "-R", "5000", "http://x/" })).config;
     try testing.expect(with_rate.closed);
+}
+
+test "streams flag parses; requires --http2 and a sane depth" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // One in flight per connection unless asked otherwise — the pre-
+    // multiplexing behaviour, and the only default that keeps `-c` meaning
+    // what every earlier release made it mean.
+    const default = (try parse(a, &[_][]const u8{"http://x/"})).config;
+    try testing.expectEqual(@as(u32, 1), default.streams);
+
+    const cfg = (try parse(a, &[_][]const u8{ "--http2", "-s", "16", "http://x/" })).config;
+    try testing.expectEqual(@as(u32, 16), cfg.streams);
+
+    // wrk-style attached short option, like every other value-taking one.
+    const attached = (try parse(a, &[_][]const u8{ "--http2", "-s8", "http://x/" })).config;
+    try testing.expectEqual(@as(u32, 8), attached.streams);
+
+    // `-s 1` is the default, so it needs no --http2 to be meaningful.
+    const explicit_one = (try parse(a, &[_][]const u8{ "-s", "1", "http://x/" })).config;
+    try testing.expectEqual(@as(u32, 1), explicit_one.streams);
+
+    // A second stream needs a protocol that has one. HTTP/1.1 pipelining is not
+    // the fallback: a pipelined request cannot be abandoned without abandoning
+    // everything queued behind it, which is the one thing --streams is for.
+    try testing.expectError(error.StreamsWithoutHttp2, parse(a, &[_][]const u8{ "-s", "2", "http://x/" }));
+    // Validation runs after the whole command line, so flag order is free.
+    const reversed = (try parse(a, &[_][]const u8{ "-s", "2", "--http2", "http://x/" })).config;
+    try testing.expectEqual(@as(u32, 2), reversed.streams);
+
+    try testing.expectError(error.ZeroStreams, parse(a, &[_][]const u8{ "--http2", "-s", "0", "http://x/" }));
+    try testing.expectError(error.TooManyStreams, parse(a, &[_][]const u8{ "--http2", "-s", "100000", "http://x/" }));
+
+    // Orthogonal to the pacing mode: a closed loop of depth N per connection is
+    // exactly h2load's default shape, and a legitimate thing to ask for.
+    const with_closed = (try parse(a, &[_][]const u8{ "--closed", "--http2", "-s", "4", "http://x/" })).config;
+    try testing.expect(with_closed.closed);
+    try testing.expectEqual(@as(u32, 4), with_closed.streams);
 }
 
 test "disable-keepalive flag parses; rejects --http2" {

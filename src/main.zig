@@ -423,6 +423,9 @@ fn printUsageError(io: Io, err: cli.ParseError) !void {
         error.ClosedWithRamp => "zrk: --closed is incompatible with a ramp (-R A:B)\n\n",
         error.ClosedWithDeadline => "zrk: --closed is incompatible with --deadline\n\n",
         error.KeepaliveWithHttp2 => "zrk: --disable-keepalive is incompatible with --http2\n\n",
+        error.ZeroStreams => "zrk: streams (-s) must be greater than 0\n\n",
+        error.StreamsWithoutHttp2 => "zrk: streams (-s) requires --http2; HTTP/1.1 has no second stream to open\n\n",
+        error.TooManyStreams => "zrk: streams (-s) exceeds the per-connection maximum\n\n",
         error.OutOfMemory => "zrk: out of memory\n\n",
     };
     try writeAll(io, .stderr(), msg);

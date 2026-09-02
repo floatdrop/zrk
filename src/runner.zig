@@ -158,6 +158,7 @@ pub fn run(
         .request_block = request_block,
         .body = cfg.body,
         .http2 = cfg.http2,
+        .streams = cfg.streams,
         .method = .of(cfg.method),
         .is_tls = cfg.url.isTls(),
         .insecure = cfg.insecure,
