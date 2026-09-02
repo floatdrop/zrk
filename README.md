@@ -59,6 +59,11 @@ Usage: zrk [options] <url>
 Options:
   -t, --threads     <N>     Total number of threads to execute load (default 2)
   -c, --connections <N>     Total connections to keep open (default 10)
+  -s, --streams     <N>     HTTP/2 streams in flight per connection
+                            (default 1). A depth knob only: -R still
+                            splits across -c, so -c 10 -s 10 offers the
+                            same rate as -c 10, not as -c 100. Requires
+                            --http2
   -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
   -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps
                             linearly from A to B over the run (default 1000)
@@ -176,6 +181,7 @@ zrk -c50 -R1000 -d5m --timeseries - http://127.0.0.1:8080/ \
 | | |
 |---|---|
 | [Coordinated omission](docs/coordinated-omission.md) | Why the correction exists, when `--closed` is the right tool, and how zrk's clock differs from wrk2's. |
+| [HTTP/2 multiplexing](docs/multiplexing.md) | What `-c` and `-s` mean once a connection carries several requests, and why `-c 10 -s 10` is not `-c 100`. |
 | [`--timeout` vs `--deadline`](docs/deadlines.md) | Bounding the latency tail under overload, and the backlog gauge. |
 | [Machine-readable output](docs/output.md) | The JSON summary, `--hdr`, `--timeseries` NDJSON, and piping rows into a live plotter. |
 | [Interrupting a run](docs/signals.md) | What SIGINT/SIGTERM report, and what supervisors should know. |

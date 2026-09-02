@@ -118,13 +118,18 @@ pub const Params = struct {
     /// case, where the header block carries END_STREAM itself.
     body: []const u8 = &.{},
     /// Speak HTTP/2 with prior knowledge instead of HTTP/1.1.
-    ///
-    /// One request is in flight either way, so nothing else in this file
-    /// changes meaning: the pacing, the coordinated-omission correction, the
-    /// deadline shedding, and `watchTimer`'s abort-by-shutdown all work on the
-    /// same terms. That equivalence is exactly what stops holding the moment a
-    /// second stream is opened, which is why multiplexing is its own slice.
     http2: bool = false,
+    /// How many of this connection's scheduled sends may be on the wire at
+    /// once (`--streams`). Requires `http2`.
+    ///
+    /// It is a depth knob and nothing more: `schedule` and `send_index` are
+    /// untouched by it, so the connection offers exactly the same load at any
+    /// `streams`. What changes is whether a send that is *due* has to wait for
+    /// the previous response before it can go out. At 1 — the default — this
+    /// file behaves exactly as it did before multiplexing existed, down to
+    /// which code path runs. See docs/multiplexing.md for why `-c` and not this
+    /// is the number to compare across runs.
+    streams: u32 = 1,
     /// Framing classification of the request method (HEAD responses have no
     /// body); see `http.RequestMethod`.
     method: httpmod.RequestMethod = .other,
@@ -219,6 +224,7 @@ pub fn run(p: *Params) void {
             io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
             continue;
         };
+        disableNagle(stream);
 
         // Establish the transport (plaintext, or a TLS session over the stream)
         // and obtain the reader/writer the HTTP layer talks to.
@@ -291,6 +297,16 @@ pub fn run(p: *Params) void {
                 io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch return;
                 continue;
             };
+        }
+
+        // Multiplexing takes over the whole connection from here: the request
+        // loop below is the serial one, and its two load-bearing assumptions —
+        // one watchdog for the connection, one `send_index` consumed in place
+        // — are exactly what a second open stream breaks.
+        if (p.http2 and p.streams > 1) {
+            runMultiplexed(p, io, &h2_session, &anchor, &send_index);
+            stream.close(io);
+            continue;
         }
 
         var conn_open = true;
@@ -540,6 +556,530 @@ fn watchTimer(
     stream.shutdown(io, .both) catch {};
 }
 
+// ── Multiplexing ────────────────────────────────────────────────────────────
+//
+// Three coroutines share one connection: `muxSend` (which runs on the
+// connection's own coroutine), `muxReceive`, and `muxWatch`. They exist because
+// the serial path's shape does not survive a second open stream. `performWork`
+// blocks until the response arrives, so it cannot pace a send while one is
+// outstanding; and one connection-wide `Watchdog` cannot time N requests that
+// started at N different moments.
+//
+// What does *not* change is the measurement. `send_index` is still consumed
+// once per send by one sender, the schedule is still solved from it, and every
+// latency sample is still measured from `scheduled`. `--streams` only decides
+// whether a send that is due has to wait for the previous response first.
+// docs/multiplexing.md has the reasoning; `--streams 1` reaches none of this.
+
+/// The most streams one connection will open at once.
+///
+/// A ceiling rather than an allocation: the slot table lives on the
+/// connection's own frame, next to the read and write buffers, which is what
+/// keeps a connection allocation-free for its whole life. Well past any real
+/// `--streams` — servers advertise limits an order of magnitude below it — and
+/// `cli.zig` refuses anything larger.
+pub const streams_max: u32 = 128;
+
+/// One in-flight request on a multiplexed connection.
+const Slot = struct {
+    /// Claimed by the sender, whether or not its stream is open yet. The gap
+    /// between the two is deliberate: the slot is claimed and its identifier
+    /// published *before* the HEADERS is written, so there is no window in
+    /// which a response arrives for a stream this table does not know.
+    busy: bool = false,
+    /// The stream carrying the request; 0 until it is opened.
+    stream: u31 = 0,
+    /// When this request was *supposed* to go out. The only clock its latency
+    /// is measured against — the coordinated-omission correction, unchanged.
+    scheduled: Io.Timestamp = .zero,
+    /// `:status`, once the response's field block has arrived.
+    status: ?u16 = null,
+    /// Response octets seen so far, field block included.
+    bytes: u64 = 0,
+    /// Absolute monotonic-ns deadline for this stream (0 = none), and whether
+    /// it came from the CO abort bound rather than the wire timeout — the same
+    /// collapse of two bounds into one that `Watchdog` does, per stream.
+    deadline_ns: u64 = 0,
+    deadline_co: bool = false,
+};
+
+/// State shared by one connection's three coroutines.
+const Mux = struct {
+    io: Io,
+    p: *Params,
+    session: *h2conn.Session,
+    slots: []Slot,
+
+    /// Guards `slots` and the three flags below — and `p.histogram` and
+    /// `p.counters`, which stop being the sender's private property the moment
+    /// the receiver is the one that knows a request finished.
+    state: Io.Mutex = .init,
+    /// Signaled whenever a slot frees or the connection ends: the two things a
+    /// sender with nowhere to put a request cares about.
+    slot_free: Io.Condition = .init,
+    /// Serializes the writer across all three: request HEADERS from the sender,
+    /// SETTINGS and PING acks and WINDOW_UPDATE from the receiver, RST_STREAM
+    /// from the watchdog.
+    ///
+    /// Separate from `state` so no I/O ever runs under the state lock — a flush
+    /// into a full socket buffer would otherwise stall the receiver. `send` is
+    /// the one place both are held, and it takes this one first; nothing takes
+    /// them the other way round.
+    write: Io.Mutex = .init,
+
+    /// Slots claimed, free or not.
+    active: u32 = 0,
+    /// GOAWAY seen: finish what is open, start nothing new.
+    no_new_streams: bool = false,
+    /// The connection is finished, for any reason.
+    dead: bool = false,
+    /// Being retired on our own terms — end of run, or a drained GOAWAY.
+    /// Streams still open then are dropped rather than counted: their requests
+    /// went out but the run stopped waiting, which is not a target failure. The
+    /// same judgement `noteError` makes about everything after `stop`.
+    retiring: bool = false,
+
+    /// Take a free slot, waiting if every stream is busy. Null means the sender
+    /// is done: the connection died, the peer said no new streams, or the wait
+    /// was canceled.
+    fn acquire(mux: *Mux) ?*Slot {
+        mux.state.lockUncancelable(mux.io);
+        defer mux.state.unlock(mux.io);
+        while (true) {
+            if (mux.dead or mux.no_new_streams) return null;
+            for (mux.slots) |*slot| {
+                if (slot.busy) continue;
+                slot.* = .{ .busy = true };
+                mux.active += 1;
+                return slot;
+            }
+            mux.slot_free.wait(mux.io, &mux.state) catch return null;
+        }
+    }
+
+    /// Free a slot and wake a sender waiting for one. Caller holds `state`.
+    fn release(mux: *Mux, slot: *Slot) void {
+        slot.* = .{};
+        mux.active -= 1;
+        mux.slot_free.signal(mux.io);
+    }
+
+    /// The slot carrying `stream`, or null if it has already been retired.
+    /// Caller holds `state`.
+    ///
+    /// An optional rather than an error because a late frame for a completed,
+    /// timed-out or reset stream is expected, not exceptional: identifiers are
+    /// never reused, so a frame naming one this table has forgotten is simply
+    /// past.
+    fn find(mux: *Mux, stream: u31) ?*Slot {
+        if (stream == 0) return null;
+        for (mux.slots) |*slot| {
+            if (slot.stream == stream) return slot;
+        }
+        return null;
+    }
+
+    /// Record a finished response and free its slot. Caller holds `state`.
+    fn complete(mux: *Mux, slot: *Slot) void {
+        const p = mux.p;
+        const done = now(mux.io);
+        // A stream that ended without `:status` is malformed (RFC 9113 section
+        // 8.3.2), and there is no honest latency sample for a request that
+        // never answered — the same call `finish` makes on the serial path.
+        const status = slot.status orelse {
+            mux.release(slot);
+            noteError(p, .read);
+            return;
+        };
+        // Coordinated-omission-corrected latency: from the time the request
+        // *should* have been sent, not when it actually went out.
+        const latency_ns = done.nanoseconds - slot.scheduled.nanoseconds;
+        const latency_us: u64 = if (latency_ns > 0) @intCast(@divTrunc(latency_ns, std.time.ns_per_us)) else 0;
+        p.histogram.record(latency_us);
+        p.counters.completed += 1;
+        p.counters.bytes += slot.bytes;
+        p.counters.recordStatus(status);
+        mux.release(slot);
+        maybePublish(p, done.nanoseconds);
+    }
+
+    /// The connection is finished. Every stream still open loses its request
+    /// with it: the serial path counts exactly one error for the one request it
+    /// had in flight, and N streams means N.
+    fn fail(mux: *Mux, kind: ErrorKind) void {
+        mux.state.lockUncancelable(mux.io);
+        defer mux.state.unlock(mux.io);
+        if (!mux.retiring) {
+            for (mux.slots) |*slot| {
+                if (!slot.busy) continue;
+                mux.release(slot);
+                noteError(mux.p, kind);
+            }
+        }
+        mux.dead = true;
+        mux.slot_free.broadcast(mux.io);
+    }
+
+    /// Stop on our own terms; see `retiring`.
+    fn retire(mux: *Mux) void {
+        mux.state.lockUncancelable(mux.io);
+        defer mux.state.unlock(mux.io);
+        mux.retiring = true;
+        mux.dead = true;
+        mux.slot_free.broadcast(mux.io);
+    }
+
+    /// Charge this send's schedule lag, and shed it if `--deadline` is already
+    /// blown. Verbatim the serial path's rule: a request staler than the
+    /// deadline can never meet it, so it is failed here without touching the
+    /// wire, which drains backlog instead of serializing through it.
+    fn shed(mux: *Mux, scheduled: Io.Timestamp, t: Io.Timestamp, send_index: *u64) bool {
+        const p = mux.p;
+        mux.state.lockUncancelable(mux.io);
+        defer mux.state.unlock(mux.io);
+        const behind_ns: i128 = t.nanoseconds - scheduled.nanoseconds;
+        if (behind_ns > 0) p.counters.noteBehind(@intCast(behind_ns));
+        if (p.deadline_ns == 0 or behind_ns <= p.deadline_ns) return false;
+        noteDeadline(p);
+        send_index.* += 1;
+        return true;
+    }
+
+    /// Publish the stream, arm its deadline, and write the request on it.
+    /// False when the connection can carry nothing more.
+    fn send(mux: *Mux, slot: *Slot, send_index: *u64) bool {
+        const p = mux.p;
+        const io = mux.io;
+
+        // Held across the registration as well as the write. The receiver needs
+        // `state` to act on a frame, and `state` is taken here before the
+        // HEADERS leaves — so the response to this stream cannot be read back
+        // before the table knows whose it is.
+        mux.write.lockUncancelable(io);
+        defer mux.write.unlock(io);
+
+        const sent = now(io);
+        {
+            mux.state.lockUncancelable(io);
+            defer mux.state.unlock(io);
+            slot.stream = mux.session.peekStream();
+            // Both bounds are absolute timestamps — the wire timeout from the
+            // actual send, the CO abort from `scheduled` — so the earlier one
+            // binds and the two collapse into a single deadline.
+            const wire: u64 = if (p.timeout_ns != 0)
+                @as(u64, @intCast(sent.nanoseconds)) + p.timeout_ns
+            else
+                0;
+            const co: u64 = if (p.deadline_abort and p.deadline_ns != 0)
+                @as(u64, @intCast(slot.scheduled.nanoseconds)) + p.deadline_ns
+            else
+                0;
+            slot.deadline_co = co != 0 and (wire == 0 or co <= wire);
+            slot.deadline_ns = if (slot.deadline_co) co else wire;
+        }
+
+        send_index.* += 1;
+
+        _ = mux.session.beginStream(p.request_block, p.body) catch |err| {
+            mux.state.lockUncancelable(io);
+            defer mux.state.unlock(io);
+            // The stream never opened, so nothing will ever close it. A refusal
+            // to open one (GOAWAY, or identifiers exhausted) sent no request
+            // and is not a failure to report; a write that broke is.
+            mux.release(slot);
+            if (err != error.Closed and !mux.retiring) noteError(p, .write);
+            mux.dead = true;
+            mux.slot_free.broadcast(io);
+            return false;
+        };
+        return true;
+    }
+};
+
+/// Drive one multiplexed connection until it dies or the run ends.
+///
+/// `anchor` and `send_index` are the connection's, not this call's: they
+/// survive a reconnect so a stall is caught up rather than reset, exactly as
+/// they do around the serial loop.
+fn runMultiplexed(
+    p: *Params,
+    io: Io,
+    session: *h2conn.Session,
+    anchor: *?Io.Timestamp,
+    send_index: *u64,
+) void {
+    // The peer's SETTINGS arrived during `open`, so its concurrency limit is
+    // known before the first send instead of discovered by overshooting it.
+    // Honouring it is not politeness: streams past the limit do not fail, they
+    // queue inside the connection, and a client that believes it has N in
+    // flight while the peer allows ten is timing its own queue and calling it
+    // the server's. (h2load does not honour it; see docs/multiplexing.md.)
+    const depth = @min(@min(p.streams, streams_max), @max(session.peer_max_concurrent_streams, 1));
+
+    var slot_storage: [streams_max]Slot = @splat(.{});
+    var mux: Mux = .{
+        .io = io,
+        .p = p,
+        .session = session,
+        .slots = slot_storage[0..depth],
+    };
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    // Without a receiver nothing can ever complete, so a connection that cannot
+    // start one is not worth sending on.
+    group.concurrent(io, muxReceive, .{&mux}) catch return;
+    // No bound to enforce, no watcher.
+    if (p.timeout_ns != 0 or (p.deadline_abort and p.deadline_ns != 0))
+        group.concurrent(io, muxWatch, .{&mux}) catch {};
+
+    muxSend(&mux, anchor, send_index);
+
+    // Stop sending, then let what is already on the wire land. Every open
+    // stream ends one of three ways — a response, its wire timeout, or its CO
+    // deadline — so this terminates on its own. The run's own teardown cancels
+    // it sooner, and the few streams still open then are dropped; see
+    // `Mux.retiring`.
+    {
+        while (true) {
+            {
+                mux.state.lockUncancelable(io);
+                defer mux.state.unlock(io);
+                if (mux.active == 0 or mux.dead) break;
+            }
+            io.sleep(Io.Duration.fromMicroseconds(200), .awake) catch break;
+        }
+    }
+    mux.retire();
+}
+
+/// The sender: solve the schedule, pace to it, and put the request on a stream.
+///
+/// Structurally the serial request loop with the blocking exchange taken out of
+/// the middle. Every step it shares with that loop — anchoring, the closed-form
+/// offset, the lag gauge, deadline shedding, the pacing sleep — means what it
+/// meant there.
+fn muxSend(mux: *Mux, anchor: *?Io.Timestamp, send_index: *u64) void {
+    const p = mux.p;
+    const io = mux.io;
+
+    while (!p.stop.load(.monotonic)) {
+        const t = now(io);
+        if (t.nanoseconds >= p.end.nanoseconds) return;
+
+        // Closed loop has no schedule to solve: the send is intended for
+        // whenever a stream frees, so the slot is taken first and `scheduled`
+        // read off the clock after. That degenerately zeroes the pacing wait,
+        // the deadline check and the CO correction, leaving genuine round-trip
+        // latency — the same trick the serial path plays, now with N loops per
+        // connection instead of one.
+        if (p.schedule == .closed) {
+            const slot = mux.acquire() orelse return;
+            slot.scheduled = now(io);
+            if (!mux.send(slot, send_index)) return;
+            continue;
+        }
+
+        // Anchor on the first send; each send's intended time is a closed-form
+        // function of its index (constant or ramp), never of any response.
+        if (anchor.* == null) anchor.* = t;
+        const offset = p.schedule.offsetNs(send_index.*, p.phase);
+        const scheduled = anchor.*.?.addDuration(Io.Duration.fromNanoseconds(@intCast(offset)));
+
+        if (mux.shed(scheduled, t, send_index)) continue;
+
+        // Pace: ahead of schedule, wait; behind, fire immediately.
+        if (scheduled.nanoseconds > t.nanoseconds) {
+            const wait = Io.Duration.fromNanoseconds(scheduled.nanoseconds - t.nanoseconds);
+            io.sleep(wait, .awake) catch return;
+        }
+
+        const slot = mux.acquire() orelse return;
+
+        // Waiting for a stream is itself schedule lag, and it is precisely the
+        // lag `--streams` exists to remove: at 1 every send waits for the
+        // previous response, at N only a connection already N deep waits at
+        // all. Charge it, and re-test the deadline against it — a request that
+        // spent its whole deadline queued here is shed rather than sent stale.
+        if (mux.shed(scheduled, now(io), send_index)) {
+            mux.state.lockUncancelable(io);
+            defer mux.state.unlock(io);
+            mux.release(slot);
+            continue;
+        }
+
+        slot.scheduled = scheduled;
+        if (!mux.send(slot, send_index)) return;
+    }
+}
+
+/// The receiver: read every frame the peer sends and fold it into the stream it
+/// belongs to. The only coroutine that touches the reader.
+fn muxReceive(mux: *Mux) void {
+    const io = mux.io;
+    const session = mux.session;
+
+    // The connection-level replacement for `frames_per_exchange_max`: this loop
+    // never finishes, so what it bounds is frames that finish *nothing*. An
+    // endless SETTINGS or PING flood is the case it exists for.
+    var idle_frames: u32 = 0;
+
+    while (idle_frames < h2conn.frames_without_progress_max) {
+        const incoming = session.receive() catch {
+            mux.fail(.read);
+            return;
+        };
+
+        const progressed = switch (incoming) {
+            .headers => |head| deliverToSlot(mux, head.stream, head.status, head.bytes, head.end_stream),
+            .data => |data| deliverToSlot(mux, data.stream, null, data.bytes, data.end_stream),
+            .reset => |stream| blk: {
+                resetOneSlot(mux, stream);
+                break :blk true;
+            },
+            .reply => |owed| blk: {
+                mux.write.lockUncancelable(io);
+                defer mux.write.unlock(io);
+                session.reply(owed) catch {
+                    mux.fail(.write);
+                    return;
+                };
+                break :blk false;
+            },
+            // Open streams may still finish; the sender stops opening new ones.
+            .going_away => blk: {
+                mux.state.lockUncancelable(io);
+                defer mux.state.unlock(io);
+                mux.no_new_streams = true;
+                mux.slot_free.broadcast(io);
+                break :blk false;
+            },
+            .idle => false,
+        };
+        idle_frames = if (progressed) 0 else idle_frames + 1;
+
+        // Give the connection window back before the budget runs out. Outside
+        // the state lock, and outside the read that produced the debt.
+        if (session.windowDue()) {
+            mux.write.lockUncancelable(io);
+            defer mux.write.unlock(io);
+            session.replenishWindow() catch {
+                mux.fail(.write);
+                return;
+            };
+        }
+    }
+    mux.fail(.read);
+}
+
+/// The watchdog: abandon each stream that outlives its bound, and *only* that
+/// stream.
+///
+/// This is the whole difference from the serial path. There, a timeout is a
+/// `stream.shutdown` — abandoning the request and the connection in one act,
+/// which is exact when they hold one request between them. Here the same act
+/// would take every other in-flight sample with it, so the bound is spent on a
+/// RST_STREAM instead and the other N − 1 responses go on arriving.
+fn muxWatch(mux: *Mux) void {
+    const io = mux.io;
+    const p = mux.p;
+
+    // How long to wait before re-checking with nothing on the wire. A quarter
+    // of the shortest bound this watcher can be asked to enforce, so an idle
+    // stretch can never oversleep a deadline armed just after it began.
+    const bound = if (p.timeout_ns != 0) p.timeout_ns else p.deadline_ns;
+    const idle_slice_ns: u64 = @max(bound / 4, std.time.ns_per_ms);
+
+    var expired: [streams_max]u31 = undefined;
+
+    while (true) {
+        var earliest: u64 = 0;
+        {
+            mux.state.lockUncancelable(io);
+            defer mux.state.unlock(io);
+            if (mux.dead) return;
+            for (mux.slots) |*slot| {
+                if (slot.stream == 0 or slot.deadline_ns == 0) continue;
+                if (earliest == 0 or slot.deadline_ns < earliest) earliest = slot.deadline_ns;
+            }
+        }
+
+        const t = now(io);
+        const wait_ns: u64 = if (earliest == 0)
+            idle_slice_ns
+        else if (@as(i128, earliest) > t.nanoseconds)
+            @intCast(@as(i128, earliest) - t.nanoseconds)
+        else
+            0;
+        if (wait_ns > 0) io.sleep(Io.Duration.fromNanoseconds(wait_ns), .awake) catch return;
+
+        var count: usize = 0;
+        {
+            mux.state.lockUncancelable(io);
+            defer mux.state.unlock(io);
+            if (mux.dead) return;
+            const at = now(io).nanoseconds;
+            for (mux.slots) |*slot| {
+                if (slot.stream == 0 or slot.deadline_ns == 0) continue;
+                if (@as(i128, slot.deadline_ns) > at) continue;
+                expired[count] = slot.stream;
+                count += 1;
+                // Freed before the reset goes out, which is what keeps the
+                // other samples intact: the receiver carries on delivering
+                // their frames, and this stream's own late frames now find no
+                // slot and are ignored.
+                const scheduled = slot.scheduled;
+                const co = slot.deadline_co;
+                mux.release(slot);
+                if (co) noteDeadline(p) else noteTimeout(p, io, scheduled);
+            }
+        }
+
+        for (expired[0..count]) |stream| {
+            mux.write.lockUncancelable(io);
+            defer mux.write.unlock(io);
+            mux.session.resetStream(stream) catch {
+                mux.fail(.write);
+                return;
+            };
+        }
+    }
+}
+
+/// Fold one frame into the stream it belongs to. Returns whether it finished a
+/// request, which is what `muxReceive`'s no-progress bound counts.
+fn deliverToSlot(mux: *Mux, stream: u31, status: ?u16, bytes: u64, end_stream: bool) bool {
+    mux.state.lockUncancelable(mux.io);
+    defer mux.state.unlock(mux.io);
+    const slot = mux.find(stream) orelse return false;
+    if (status) |code| {
+        // A second field block on a stream that already has a status is
+        // trailers, and trailers carry none (RFC 9113 section 8.1).
+        if (slot.status != null) {
+            mux.release(slot);
+            noteError(mux.p, .read);
+            return true;
+        }
+        slot.status = code;
+    }
+    slot.bytes += bytes;
+    if (!end_stream) return false;
+    mux.complete(slot);
+    return true;
+}
+
+/// The peer reset one stream (section 6.4). That request is lost; the
+/// connection and every other stream on it are not — which is the difference
+/// from the serial path, where the same frame ends the connection because there
+/// is nothing else on it to keep.
+fn resetOneSlot(mux: *Mux, stream: u31) void {
+    mux.state.lockUncancelable(mux.io);
+    defer mux.state.unlock(mux.io);
+    const slot = mux.find(stream) orelse return;
+    mux.release(slot);
+    noteError(mux.p, .read);
+}
+
 /// Send the fixed request and parse one response; touches only the
 /// transport, never the shared counters.
 fn performWork(
@@ -589,11 +1129,16 @@ fn now(io: Io) Io.Timestamp {
     return Io.Timestamp.now(io, .awake);
 }
 
+/// Which socket-level counter a failure lands in. Named rather than anonymous
+/// because the multiplexed path decides the kind in one place and reports it in
+/// another.
+const ErrorKind = enum { connect, write, read };
+
 /// Record a socket error, unless we are shutting down — errors caused by
 /// cancelling in-flight I/O at end-of-test are artifacts, not real failures.
 /// Publishes so the live dashboard sees error-only periods (a total outage
 /// produces no successful responses to publish through).
-fn noteError(p: *Params, kind: enum { connect, write, read }) void {
+fn noteError(p: *Params, kind: ErrorKind) void {
     if (p.stop.load(.monotonic)) return;
     switch (kind) {
         .connect => p.counters.connect_errors += 1,
@@ -662,6 +1207,30 @@ fn deadlineBoundedTimeout(wire_timeout_ns: u64, remaining_ns: u64) u64 {
     return remaining_ns;
 }
 
+/// Turn Nagle's algorithm off on a socket zrk measures through.
+///
+/// Nagle holds a small write back until the previous one has been
+/// acknowledged, and Linux delays that acknowledgement by up to 40 ms. With one
+/// request in flight the two can barely collide: nothing of ours is
+/// unacknowledged at the moment the next request is written, because the
+/// response that acknowledged it is what released the next send. Multiplexing
+/// makes them collide by design — a second request written while the first is
+/// still outstanding is the entire point of `--streams` — and Nagle answers it
+/// by parking that request until a delayed-ACK timer expires. Left on, it puts
+/// 40 ms of the client's own transport behaviour into the target's latency,
+/// which is the exact failure this tool exists not to have.
+///
+/// Best effort: a transport that will not take the option is not a reason to
+/// abandon the connection.
+fn disableNagle(stream: net.Stream) void {
+    std.posix.setsockopt(
+        stream.socket.handle,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        &std.mem.toBytes(@as(c_int, 1)),
+    ) catch {};
+}
+
 fn connect(io: Io, address: net.IpAddress, timeout_ns: u64) !net.Stream {
     // The response timeout is enforced per-request by `watchTimer`.
     const timeout: Io.Timeout = if (timeout_ns != 0) .{ .duration = .{ .raw = Io.Duration.fromNanoseconds(timeout_ns), .clock = .awake } } else .none;
@@ -718,6 +1287,7 @@ fn serveConn(io: Io, stream: *net.Stream) void {
 fn h2Serve(io: Io, server: *net.Server) void {
     var stream = server.accept(io) catch return;
     defer stream.close(io);
+    disableNagle(stream);
     var rbuf: [16 * 1024]u8 = undefined;
     var wbuf: [16 * 1024]u8 = undefined;
     var r = stream.reader(io, &rbuf);
@@ -869,6 +1439,306 @@ test "run drives HTTP/2 requests against a local h2c server" {
     // Two octets of body plus the response header block, per request.
     try testing.expect(counters.bytes >= counters.completed * 2);
     try testing.expectEqual(counters.completed, counters.status_class[2]);
+}
+
+/// Read the preface and answer SETTINGS, leaving the caller the frame loop.
+/// Shared by the three h2c test servers below.
+fn h2Greet(reader: *Io.Reader, writer: *Io.Writer) bool {
+    const magic = reader.take(h2conn.preface.len) catch return false;
+    if (!std.mem.eql(u8, magic, h2conn.preface)) return false;
+    // Our SETTINGS, empty: the defaults are fine for a test server.
+    writeTestFrame(writer, .settings, 0, 0, &.{}) catch return false;
+    writer.flush() catch return false;
+    return true;
+}
+
+/// Answer one stream with a 200 and two octets of body.
+fn h2Answer(writer: *Io.Writer, block: []const u8, stream: u31) bool {
+    writeTestFrame(writer, .headers, h2.frame.Flag.end_headers.bit(), stream, block) catch return false;
+    writeTestFrame(writer, .data, h2.frame.Flag.end_stream.bit(), stream, "hi") catch return false;
+    writer.flush() catch return false;
+    return true;
+}
+
+/// The 200 response block every test server sends, encoded once.
+fn h2ResponseBlock(buffer: []u8) []const u8 {
+    var storage: h2.hpack.Encoder.Storage(0) = .{};
+    var encoder = storage.encoder(.static_only);
+    const encoded = encoder.encode(buffer, &.{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/plain" },
+    });
+    return buffer[0..encoded.written];
+}
+
+/// An h2c server that answers request *k* only once request *k+1* has arrived.
+///
+/// A client that cannot hold two streams open at once therefore never gets a
+/// single response out of it: it sends, waits, and the answer it is waiting for
+/// is gated on a request it cannot send until the answer comes. That deadlock
+/// is the point — it makes "two requests really were in flight at once" a thing
+/// a test can assert without measuring time.
+fn h2LockstepServe(io: Io, server: *net.Server) void {
+    var stream = server.accept(io) catch return;
+    defer stream.close(io);
+    disableNagle(stream);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var wbuf: [16 * 1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var w = stream.writer(io, &wbuf);
+    const reader = &r.interface;
+    const writer = &w.interface;
+    if (!h2Greet(reader, writer)) return;
+
+    var block_buf: [64]u8 = undefined;
+    const block = h2ResponseBlock(&block_buf);
+
+    var held: ?u31 = null;
+    while (true) {
+        const octets = reader.take(h2.frame.Header.octets) catch return;
+        const header = h2.frame.Header.parse(octets) catch return;
+        if (header.length > 0) _ = reader.take(header.length) catch return;
+
+        switch (header.frame_type) {
+            .settings => if (!header.has(.ack)) {
+                writeTestFrame(writer, .settings, h2.frame.Flag.ack.bit(), 0, &.{}) catch return;
+                writer.flush() catch return;
+            },
+            .headers => {
+                if (held) |earlier| {
+                    if (!h2Answer(writer, block, earlier)) return;
+                }
+                held = header.stream_identifier;
+            },
+            else => {},
+        }
+    }
+}
+
+/// An h2c server that answers every stream except the client's first, which it
+/// holds open forever — and counts the RST_STREAMs it is sent.
+///
+/// The multiplexed timeout path in one server. With one stream per connection
+/// the only way to abandon a stalled request is to drop the connection, and
+/// every other in-flight sample goes with it; the whole of what `--streams`
+/// changes here is that the bound is spent on a RST_STREAM instead.
+fn h2StallServe(io: Io, server: *net.Server, resets: *std.atomic.Value(u32)) void {
+    var stream = server.accept(io) catch return;
+    defer stream.close(io);
+    disableNagle(stream);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var wbuf: [16 * 1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var w = stream.writer(io, &wbuf);
+    const reader = &r.interface;
+    const writer = &w.interface;
+    if (!h2Greet(reader, writer)) return;
+
+    var block_buf: [64]u8 = undefined;
+    const block = h2ResponseBlock(&block_buf);
+
+    while (true) {
+        const octets = reader.take(h2.frame.Header.octets) catch return;
+        const header = h2.frame.Header.parse(octets) catch return;
+        if (header.length > 0) _ = reader.take(header.length) catch return;
+
+        switch (header.frame_type) {
+            .settings => if (!header.has(.ack)) {
+                writeTestFrame(writer, .settings, h2.frame.Flag.ack.bit(), 0, &.{}) catch return;
+                writer.flush() catch return;
+            },
+            // Section 5.1.1: the client's first stream is 1. Held open, never
+            // answered, never reset from this side.
+            .headers => if (header.stream_identifier != 1) {
+                if (!h2Answer(writer, block, header.stream_identifier)) return;
+            },
+            .rst_stream => _ = resets.fetchAdd(1, .monotonic),
+            else => {},
+        }
+    }
+}
+
+/// The `Params` the multiplexed tests share, minus the parts each one varies.
+fn muxParams(
+    io: Io,
+    server_addr: net.IpAddress,
+    block: []const u8,
+    streams: u32,
+    end: Io.Timestamp,
+    timeout_ns: u64,
+    stop: *std.atomic.Value(bool),
+    histogram: *hdr.Histogram,
+    counters: *Counters,
+) Params {
+    return .{
+        .io = io,
+        .address = server_addr,
+        .host = "127.0.0.1",
+        .request = "",
+        .request_block = block,
+        .http2 = true,
+        .streams = streams,
+        .is_tls = false,
+        .insecure = false,
+        .schedule = .{ .constant = .{ .interval_ns = 2 * std.time.ns_per_ms } },
+        .timeout_ns = timeout_ns,
+        .end = end,
+        .stop = stop,
+        .histogram = histogram,
+        .counters = counters,
+    };
+}
+
+test "streams put more than one request on the wire at once" {
+    // The assertion is structural, not timed: `h2LockstepServe` will not answer
+    // a request until the *next* one has arrived, so a completed response is
+    // proof that two streams were open together. At `--streams 1` this same
+    // server produces nothing but timeouts, which is the case below it.
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    var group: Io.Group = .init;
+    group.async(io, h2LockstepServe, .{ io, &server });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    var cfg: cli.Config = .{ .http2 = true };
+    cfg.url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = "/" };
+    const block = try httpmod.buildRequestBlock(testing.allocator, &cfg);
+    defer testing.allocator.free(block);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(300));
+    var params = muxParams(io, server_addr, block, 4, end, 50 * std.time.ns_per_ms, &stop, &histogram, &counters);
+    run(&params);
+
+    group.await(io) catch {};
+    server.deinit(io);
+
+    try testing.expect(counters.completed > 1);
+    try testing.expectEqual(@as(u64, 0), counters.read_errors);
+    try testing.expectEqual(@as(u64, 0), counters.write_errors);
+    try testing.expectEqual(@as(u64, 0), counters.status_errors);
+    // The server holds one request back by construction, so the stream still
+    // open when the run ends has nothing to answer it: exactly one bound blows.
+    try testing.expect(counters.timeouts <= 1);
+    // The property #21 shipped and this slice had to keep. Timed-out requests
+    // are recorded too (`record_timeouts` defaults on), so they count here.
+    try testing.expectEqual(counters.completed + counters.timeouts, histogram.count());
+}
+
+test "a stalled stream is reset alone, leaving the other samples intact" {
+    // The whole difference between this slice and the serial one. `run` would
+    // answer a stalled request by shutting the socket down, which is exact when
+    // the connection holds one request and destroys N − 1 innocent samples when
+    // it holds N. Here the bound is spent on a RST_STREAM for the one stream
+    // that blew it, and the connection carries on measuring.
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var server = try bind_addr.listen(io, .{ .reuse_address = true });
+    const port = server.socket.address.getPort();
+    const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+    var resets = std.atomic.Value(u32).init(0);
+    var group: Io.Group = .init;
+    group.async(io, h2StallServe, .{ io, &server, &resets });
+
+    var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+    defer histogram.deinit();
+    var counters: Counters = .{};
+    var stop = std.atomic.Value(bool).init(false);
+
+    var cfg: cli.Config = .{ .http2 = true };
+    cfg.url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = "/" };
+    const block = try httpmod.buildRequestBlock(testing.allocator, &cfg);
+    defer testing.allocator.free(block);
+
+    const start = Io.Timestamp.now(io, .awake);
+    const end = start.addDuration(Io.Duration.fromMilliseconds(400));
+    var params = muxParams(io, server_addr, block, 4, end, 40 * std.time.ns_per_ms, &stop, &histogram, &counters);
+    run(&params);
+
+    group.await(io) catch {};
+    server.deinit(io);
+
+    // Exactly one stream stalled, so exactly one bound blew.
+    try testing.expectEqual(@as(u64, 1), counters.timeouts);
+    // And it was abandoned by resetting that stream, not the connection: the
+    // server saw the RST_STREAM, and never had to re-accept.
+    try testing.expectEqual(@as(u32, 1), resets.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), counters.connect_errors);
+    try testing.expectEqual(@as(u64, 0), counters.read_errors);
+    try testing.expectEqual(@as(u64, 0), counters.write_errors);
+    // The samples that had nothing to do with it survived — many of them, and
+    // still arriving after the reset.
+    try testing.expect(counters.completed > 5);
+    // `record_timeouts` is on by default, so the abandoned request is a sample
+    // too; every other completion is one, and nothing else is.
+    try testing.expectEqual(counters.completed + counters.timeouts, histogram.count());
+}
+
+test "streams leave the offered load alone" {
+    // `--streams` is a depth knob: it changes whether a due send has to wait
+    // for the previous response, never what is due or when. Against a server
+    // that answers instantly there is nothing to wait for, so the same schedule
+    // must produce the same number of sends at any depth.
+    var rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var completed: [2]u64 = undefined;
+    for ([_]u32{ 1, 8 }, 0..) |streams, index| {
+        const bind_addr = try net.IpAddress.parse("127.0.0.1", 0);
+        var server = try bind_addr.listen(io, .{ .reuse_address = true });
+        const port = server.socket.address.getPort();
+        const server_addr = try net.IpAddress.parse("127.0.0.1", port);
+
+        var group: Io.Group = .init;
+        group.async(io, h2Serve, .{ io, &server });
+
+        var histogram = try hdr.Histogram.init(testing.allocator, 1, 3_600_000_000, 3);
+        defer histogram.deinit();
+        var counters: Counters = .{};
+        var stop = std.atomic.Value(bool).init(false);
+
+        var cfg: cli.Config = .{ .http2 = true };
+        cfg.url = .{ .scheme = .http, .host = "127.0.0.1", .port = port, .target = "/" };
+        const block = try httpmod.buildRequestBlock(testing.allocator, &cfg);
+        defer testing.allocator.free(block);
+
+        const start = Io.Timestamp.now(io, .awake);
+        const end = start.addDuration(Io.Duration.fromMilliseconds(200));
+        var params = muxParams(io, server_addr, block, streams, end, 50 * std.time.ns_per_ms, &stop, &histogram, &counters);
+        run(&params);
+
+        group.await(io) catch {};
+        server.deinit(io);
+
+        try testing.expect(counters.completed > 0);
+        try testing.expectEqual(counters.completed, histogram.count());
+        try testing.expectEqual(@as(u64, 0), counters.read_errors);
+        completed[index] = counters.completed;
+    }
+
+    // A 2 ms schedule over 200 ms is ~100 sends either way. Loose enough for a
+    // loaded CI box, tight enough that a depth knob quietly become a rate knob
+    // — the `-c × -s` reading this design rejected — would fail it.
+    const serial: f64 = @floatFromInt(completed[0]);
+    const deep: f64 = @floatFromInt(completed[1]);
+    try testing.expect(deep < serial * 1.5);
+    try testing.expect(deep > serial * 0.5);
 }
 
 test "run drives keep-alive requests against a local server" {

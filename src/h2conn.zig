@@ -113,6 +113,35 @@ comptime {
 /// — a 16 KiB-framed megabyte response is 64 DATA frames.
 const frames_per_exchange_max: u32 = 4096;
 
+/// The same bound, moved to the connection for a multiplexing caller.
+///
+/// `frames_per_exchange_max` works because a serial exchange either finishes or
+/// gives up. A receive loop that serves N streams never finishes, so what it
+/// bounds instead is frames *without progress*: an endless SETTINGS or PING
+/// flood completes no stream, and a connection that completes nothing after
+/// this many frames is not one worth measuring through.
+pub const frames_without_progress_max: u32 = frames_per_exchange_max;
+
+/// Connection-window debt at which we hand the peer its credit back.
+///
+/// `open` raises the connection window to the 31-bit maximum, which reads as
+/// "flow control off" and is what it amounts to for one response at a time. It
+/// is not: the window is a budget for the connection's *whole life*, and every
+/// DATA octet spends it. One reader taking one response at a time still spends
+/// it — just slowly enough that a short run finishes first — and N streams
+/// share the same budget. Replenishing at half keeps a WINDOW_UPDATE off the
+/// hot path (one per gibibyte) while making the budget genuinely unbounded.
+const window_replenish_at: u32 = window_max / 2;
+
+/// Section 6.7: a PING payload is eight octets.
+const ping_octets: usize = 8;
+
+/// Section 6.5.2's default for `SETTINGS_MAX_CONCURRENT_STREAMS`: no limit
+/// until the peer sends one. Sentinel rather than an optional because every
+/// caller wants the number, and "unlimited" is a number here — no run opens
+/// four billion streams on one connection.
+pub const concurrent_streams_unlimited: u32 = std.math.maxInt(u32);
+
 pub const Error = error{
     /// The peer spoke something that is not HTTP/2, or broke a rule this client
     /// is unwilling to continue past.
@@ -124,6 +153,38 @@ pub const Error = error{
     TooLarge,
     /// The transport failed.
     Io,
+};
+
+/// What one received frame means to a caller. See `Session.receive`.
+///
+/// Deliberately per-frame and per-stream rather than per-response: once several
+/// streams are open, "the response" is not something the connection layer can
+/// return — which stream belongs to which request is the caller's bookkeeping.
+/// What stays behind this seam is everything that needs connection-scoped state
+/// to decide: field-block assembly, HPACK, the peer's settings, flow control.
+pub const Incoming = union(enum) {
+    /// A complete field block ended on `stream`, carrying this `:status`.
+    /// `bytes` is the block's own size, counted like any other response octets.
+    headers: struct { stream: u31, status: u16, bytes: u64, end_stream: bool },
+    /// DATA arrived on `stream`.
+    data: struct { stream: u31, bytes: u64, end_stream: bool },
+    /// The peer reset `stream` (section 6.4). That stream is over; the
+    /// connection is not.
+    reset: u31,
+    /// The peer is owed an answer. Sent with `Session.reply` by whoever holds
+    /// the writer.
+    reply: Reply,
+    /// GOAWAY: no new stream may be opened. Open streams may still finish.
+    going_away,
+    /// Nothing a caller can act on — a field-block fragment mid-assembly, or a
+    /// frame the RFC says to ignore.
+    idle,
+};
+
+/// An answer the peer is owed, deferred to whoever owns the writer.
+pub const Reply = union(enum) {
+    settings_ack,
+    ping_ack: [ping_octets]u8,
 };
 
 /// Per-connection state, pinned by the caller for the connection's lifetime.
@@ -143,9 +204,38 @@ pub const Session = struct {
     /// Section 6.5.2's default until the peer says otherwise.
     peer_max_frame_size: u32 = frame.Header.max_frame_size_min,
 
+    /// The peer's `SETTINGS_MAX_CONCURRENT_STREAMS`. A multiplexing client has
+    /// to honour it — the effective depth is `min(--streams, this)` — and
+    /// ignoring it is not harmless: the surplus does not fail, it queues, and a
+    /// client that thinks it has N in flight while the peer allows ten is
+    /// measuring a queue it cannot see. (h2load ignores it; see
+    /// docs/multiplexing.md.)
+    peer_max_concurrent_streams: u32 = concurrent_streams_unlimited,
+
     /// Set when the peer has sent GOAWAY. The exchange in flight may still
     /// complete; no new stream may be opened.
     peer_going_away: bool = false,
+
+    /// DATA octets received since the last connection-level `WINDOW_UPDATE`.
+    /// See `window_replenish_at`.
+    window_debt: u32 = 0,
+
+    /// Field-block assembly and HPACK decoding, both connection-scoped.
+    ///
+    /// Per-connection rather than per-response because that is what the RFC
+    /// makes them. Section 6.10 forbids any frame between a HEADERS and its
+    /// CONTINUATIONs, on any stream, so at most one block is ever in flight and
+    /// one assembler serves every stream. The decoder's dynamic table is
+    /// per-connection by definition — ours is empty, since we advertise
+    /// `SETTINGS_HEADER_TABLE_SIZE = 0`, which is what lets it be sized zero
+    /// rather than what lets it be per-response.
+    ///
+    /// Both point into this struct's own buffers, so they are established by
+    /// `open` (where the session is pinned) rather than by `init` (which
+    /// returns by value and would hand back dangling pointers).
+    assembler: frame.BlockAssembler = undefined,
+    decoder: hpack.Decoder = undefined,
+    table_storage: hpack.DynamicTable.Storage(0) = .{},
 
     assembler_buffer: [block_buffer_size]u8 = undefined,
     field_buffer: [field_buffer_size]u8 = undefined,
@@ -166,6 +256,14 @@ pub const Session = struct {
     /// until it has seen one SETTINGS from the peer, acknowledging it, which is
     /// the first thing any conforming server sends.
     pub fn open(session: *Session) Error!void {
+        // The session is pinned from here on, so the two buffer-borrowing
+        // pieces of state can finally be built. See their declarations.
+        session.assembler = .init(
+            &session.assembler_buffer,
+            frame.BlockAssembler.frames_max_default,
+        );
+        session.decoder = .init(session.table_storage.table(), header_list_max);
+
         session.writer.writeAll(preface) catch return error.Io;
         try session.writeSettings();
         // Raise the connection-level window as far as it goes. `SETTINGS`
@@ -185,7 +283,7 @@ pub const Session = struct {
                 session.writer.flush() catch return error.Io;
                 return;
             }
-            try session.handleConnectionFrame(header);
+            try session.answer(try session.classify(header));
         }
         return error.Protocol;
     }
@@ -199,6 +297,17 @@ pub const Session = struct {
     /// replayed byte-identically on every stream. That guarantee is why this
     /// function takes bytes rather than fields.
     pub fn exchange(session: *Session, block: []const u8, body: []const u8) Error!httpmod.Response {
+        return session.readResponse(try session.beginStream(block, body));
+    }
+
+    /// Open one stream and send the request on it, without waiting for the
+    /// response. Returns the stream identifier the answer will arrive on.
+    ///
+    /// Split out of `exchange` for the multiplexing caller, which has to be
+    /// able to send while earlier streams are still open. Writes and flushes,
+    /// so a caller sharing the writer with a receive loop holds its write lock
+    /// across this.
+    pub fn beginStream(session: *Session, block: []const u8, body: []const u8) Error!u31 {
         if (session.peer_going_away) return error.Closed;
 
         const stream = session.next_stream;
@@ -212,72 +321,184 @@ pub const Session = struct {
         try session.writeHeaders(stream, block, body.len == 0);
         if (body.len > 0) try session.writeData(stream, body);
         session.writer.flush() catch return error.Io;
+        return stream;
+    }
 
-        return session.readResponse(stream);
+    /// The identifier `beginStream` will use next.
+    ///
+    /// For a caller that must publish a stream in its own bookkeeping *before*
+    /// the HEADERS is on the wire: without it there is a window in which the
+    /// response arrives for a stream nobody has claimed, and its latency sample
+    /// is lost. Valid only while the caller holds whatever serializes
+    /// `beginStream`.
+    pub fn peekStream(session: *const Session) u31 {
+        return session.next_stream;
+    }
+
+    /// Abandon one stream without touching the connection (section 6.4).
+    ///
+    /// This is the whole of what multiplexing changes about aborting a request.
+    /// With one stream open, "abort this request" and "abort this connection"
+    /// are the same act, and `connection.zig` implements the first as the
+    /// second by shutting the socket down. With N open, that would take N − 1
+    /// innocent latency samples with it, so a timeout has to be spent here
+    /// instead.
+    pub fn resetStream(session: *Session, stream: u31) Error!void {
+        var payload: [4]u8 = undefined;
+        std.mem.writeInt(u32, &payload, @intFromEnum(frame.ErrorCode.cancel), .big);
+        try session.writeFrame(.rst_stream, 0, stream, &payload);
+        session.writer.flush() catch return error.Io;
+    }
+
+    /// Read one frame and say what it means, without writing anything.
+    ///
+    /// The no-writing part is the point: a multiplexing caller reads on one
+    /// coroutine and sends on another, so a frame the peer is owed an answer to
+    /// comes back as `Incoming.reply` for the caller to send once it holds the
+    /// write lock, rather than being answered from under a blocking read.
+    pub fn receive(session: *Session) Error!Incoming {
+        return session.classify(try session.readHeader());
+    }
+
+    /// Send an answer `receive` reported as owed.
+    pub fn reply(session: *Session, owed: Reply) Error!void {
+        switch (owed) {
+            // Section 6.5.3: acknowledged whether or not we act on it.
+            .settings_ack => try session.writeFrame(.settings, frame.Flag.ack.bit(), 0, &.{}),
+            // Section 6.7: a PING we did not send must be echoed with ACK.
+            .ping_ack => |data| try session.writeFrame(.ping, frame.Flag.ack.bit(), 0, &data),
+        }
+        session.writer.flush() catch return error.Io;
+    }
+
+    /// Whether enough DATA has arrived to be worth giving the connection window
+    /// back. See `window_replenish_at`.
+    pub fn windowDue(session: *const Session) bool {
+        return session.window_debt >= window_replenish_at;
+    }
+
+    /// Credit the peer with every DATA octet consumed since the last call.
+    /// Writes, so the same write-lock rule as `beginStream` applies.
+    pub fn replenishWindow(session: *Session) Error!void {
+        const debt = session.window_debt;
+        if (debt == 0) return;
+        session.window_debt = 0;
+        try session.writeWindowUpdate(0, debt);
+        session.writer.flush() catch return error.Io;
+    }
+
+    /// Perform whatever `incoming` obliges us to, for a caller that owns the
+    /// writer outright. The single-threaded paths — `open`, `readResponse` —
+    /// answer inline; a multiplexing caller takes its write lock instead.
+    fn answer(session: *Session, incoming: Incoming) Error!void {
+        switch (incoming) {
+            .reply => |owed| try session.reply(owed),
+            else => {},
+        }
     }
 
     /// Read frames until `stream` carries END_STREAM, handling everything else
     /// the connection may interleave.
+    ///
+    /// The serial half of the client: one stream is open, so every frame naming
+    /// another stream is a late one from a stream already finished, and
+    /// ignorable rather than fatal.
     fn readResponse(session: *Session, stream: u31) Error!httpmod.Response {
-        var assembler: frame.BlockAssembler = .init(
-            &session.assembler_buffer,
-            frame.BlockAssembler.frames_max_default,
-        );
-        // `SETTINGS_HEADER_TABLE_SIZE = 0` is what makes this correct with no
-        // arena: we forbade the peer the dynamic table, so a decoder with an
-        // empty one is not a shortcut, it is the configuration we advertised.
-        // A peer that indexes into it anyway gets a decode error, which is the
-        // right answer.
-        var table_storage: hpack.DynamicTable.Storage(0) = .{};
-        var decoder: hpack.Decoder = .init(table_storage.table(), header_list_max);
-
         var status: ?u16 = null;
         var bytes: u64 = 0;
         var frames: u32 = 0;
 
         while (frames < frames_per_exchange_max) : (frames += 1) {
-            const header = try session.readHeader();
-
-            // Another stream's frame, or a connection-level one. With one
-            // request in flight the only streams that can appear are this one
-            // and ones we have already finished, whose late frames are
-            // ignorable rather than fatal.
-            if (header.stream_identifier != stream) {
-                try session.handleConnectionFrame(header);
-                continue;
-            }
-
-            const payload_bytes = try session.readPayload(header);
-            const payload = frame.payload.parse(header, payload_bytes) catch return error.Protocol;
-
-            // The CONTINUATION state machine's refusals are all reasons to stop
-            // using this connection: an interleaved frame or an unbounded block
-            // means the peer is not framing the way section 6.10 requires.
-            const accepted = assembler.accept(header, &payload) catch return error.Protocol;
-            switch (accepted) {
-                .fragment => continue,
-                .block => |complete| {
+            if (session.windowDue()) try session.replenishWindow();
+            switch (try session.receive()) {
+                .headers => |head| {
+                    if (head.stream != stream) continue;
                     if (status != null) return error.Protocol; // trailers carry no status
-                    status = try decodeStatus(&decoder, &session.field_buffer, complete.fragment);
-                    bytes += complete.fragment.len;
-                    if (complete.end_stream) return finish(status, bytes);
-                    continue;
+                    status = head.status;
+                    bytes += head.bytes;
+                    if (head.end_stream) return finish(status, bytes);
                 },
-                .passthrough => {},
-            }
-
-            switch (payload) {
                 .data => |data| {
-                    bytes += data.data.len;
-                    // Consumed the moment it arrives, so the window we opened in
-                    // `open` is the only flow control this client needs.
-                    if (header.has(.end_stream)) return finish(status, bytes);
+                    if (data.stream != stream) continue;
+                    bytes += data.bytes;
+                    if (data.end_stream) return finish(status, bytes);
                 },
-                .rst_stream => return error.Closed,
-                else => return error.Protocol,
+                .reset => |reset| if (reset == stream) return error.Closed,
+                .reply => |owed| try session.reply(owed),
+                // Recorded on the session; the exchange in flight may finish.
+                .going_away, .idle => {},
             }
         }
         return error.Protocol;
+    }
+
+    /// What one frame means, once the connection-scoped state — field-block
+    /// assembly, HPACK, the peer's settings, the flow-control debt — has had
+    /// its say. Reads the payload; writes nothing.
+    fn classify(session: *Session, header: frame.Header) Error!Incoming {
+        const payload_bytes = try session.readPayload(header);
+        const payload = frame.payload.parse(header, payload_bytes) catch return error.Protocol;
+
+        // Before the assembler, which would otherwise assemble a PUSH_PROMISE's
+        // field block as if it were a response. We advertised
+        // `SETTINGS_ENABLE_PUSH = 0`; section 8.4 makes one a connection error,
+        // and there is no honest latency sample for a stream nobody scheduled.
+        if (payload == .push_promise) return error.Protocol;
+
+        // The CONTINUATION state machine's refusals are all reasons to stop
+        // using this connection: an interleaved frame or an unbounded block
+        // means the peer is not framing the way section 6.10 requires.
+        const accepted = session.assembler.accept(header, &payload) catch return error.Protocol;
+        switch (accepted) {
+            .fragment => return .idle,
+            .block => |complete| return .{ .headers = .{
+                .stream = header.stream_identifier,
+                .status = try decodeStatus(&session.decoder, &session.field_buffer, complete.fragment),
+                .bytes = complete.fragment.len,
+                .end_stream = complete.end_stream,
+            } },
+            .passthrough => {},
+        }
+
+        switch (payload) {
+            .data => |data| {
+                // Consumed the moment it arrives — this client never stalls a
+                // reader — so the only flow control left is giving the
+                // connection window back before the budget runs out.
+                session.window_debt +|= @intCast(data.data.len);
+                return .{ .data = .{
+                    .stream = header.stream_identifier,
+                    .bytes = data.data.len,
+                    .end_stream = header.has(.end_stream),
+                } };
+            },
+            .rst_stream => return .{ .reset = header.stream_identifier },
+            // Section 6.5: take what we are told, and acknowledge.
+            .settings => {
+                if (header.has(.ack)) return .idle;
+                try session.takeSettings(payload);
+                return .{ .reply = .settings_ack };
+            },
+            .ping => |ping| {
+                if (header.has(.ack)) return .idle;
+                return .{ .reply = .{ .ping_ack = ping.opaque_data.* } };
+            },
+            // Section 6.8: no new stream after this. Streams already open may
+            // still finish, so this is recorded rather than raised.
+            .goaway => {
+                session.peer_going_away = true;
+                return .going_away;
+            },
+            // Window updates only matter to a sender, and the only thing this
+            // client sends is a request block. Ignorable rather than tracked.
+            .window_update => return .idle,
+            // Section 5.3.1 allows PRIORITY on any stream at any time, and
+            // section 4.1 says to skip an unknown type by its length — which
+            // the payload read already did.
+            .priority, .unknown => return .idle,
+            // Rejected above; field-block frames never reach here.
+            .push_promise, .headers, .continuation => return .idle,
+        }
     }
 
     fn readHeader(session: *Session) Error!frame.Header {
@@ -286,43 +507,6 @@ pub const Session = struct {
 
     fn readPayload(session: *Session, header: frame.Header) Error![]const u8 {
         return readPayloadImpl(session, header);
-    }
-
-    /// Everything that is not this exchange's stream.
-    ///
-    /// A load generator has to answer only three of these. The rest are either
-    /// ignorable by the RFC or a reason to stop using the connection, and
-    /// saying which is which in one place is what keeps `readResponse` about
-    /// the response.
-    fn handleConnectionFrame(session: *Session, header: frame.Header) Error!void {
-        const payload_bytes = try session.readPayload(header);
-        const payload = frame.payload.parse(header, payload_bytes) catch return error.Protocol;
-        switch (payload) {
-            // Section 6.5: acknowledge, and take what we are told.
-            .settings => if (!header.has(.ack)) {
-                try session.applySettingsPayload(payload);
-                session.writer.flush() catch return error.Io;
-            },
-            // Section 6.7: a PING we did not send must be echoed with ACK.
-            .ping => |ping| if (!header.has(.ack)) {
-                try session.writeFrame(.ping, frame.Flag.ack.bit(), 0, ping.opaque_data);
-                session.writer.flush() catch return error.Io;
-            },
-            // Section 6.8: no new stream after this. The exchange in flight may
-            // still finish, so this is recorded rather than raised.
-            .goaway => session.peer_going_away = true,
-            // We advertised `SETTINGS_ENABLE_PUSH = 0`; section 8.4 makes a
-            // PUSH_PROMISE after that a connection error, and there is no
-            // honest latency sample for a stream nobody scheduled.
-            .push_promise => return error.Protocol,
-            // Window updates only matter to a sender, and this client sends a
-            // request block and nothing more. Ignorable rather than tracked.
-            .window_update => {},
-            // A stream we already finished, ending late.
-            .rst_stream, .data, .headers, .continuation => {},
-            .priority => {},
-            .unknown => {}, // Section 4.1: skip by length, which the read did.
-        }
     }
 
     fn writeSettings(session: *Session) Error!void {
@@ -347,17 +531,20 @@ pub const Session = struct {
     fn applySettings(session: *Session, header: frame.Header) Error!void {
         const payload_bytes = try session.readPayload(header);
         const payload = frame.payload.parse(header, payload_bytes) catch return error.Protocol;
-        try session.applySettingsPayload(payload);
+        try session.takeSettings(payload);
+        try session.reply(.settings_ack);
     }
 
-    /// Take the peer's settings, and acknowledge them.
+    /// Take the peer's settings. Acknowledging them is the caller's, via
+    /// `Incoming.reply` — see `receive` for why that is not done here.
     ///
-    /// Only `SETTINGS_MAX_FRAME_SIZE` changes what this client does — it bounds
-    /// what we may send, and our one send is a header block that could exceed
-    /// the default if a caller passes enough `-H`. The rest describe limits on
-    /// a sender we are not: we open one stream at a time and send no body large
-    /// enough to meet a window.
-    fn applySettingsPayload(session: *Session, payload: frame.Payload) Error!void {
+    /// Two of them change what this client does. `SETTINGS_MAX_FRAME_SIZE`
+    /// bounds what we may send, and our send is a header block that could
+    /// exceed the default if a caller passes enough `-H`.
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` bounds how many streams `--streams`
+    /// may actually open. The rest describe limits on a sender we are not: we
+    /// send no body large enough to meet a window.
+    fn takeSettings(session: *Session, payload: frame.Payload) Error!void {
         var entries = payload.settings.iterate();
         while (entries.next()) |entry| {
             // Section 6.5.2: an identifier we do not know must be ignored, not
@@ -368,13 +555,13 @@ pub const Session = struct {
                     if (entry.value > frame.Header.max_frame_size_max) return error.Protocol;
                     session.peer_max_frame_size = entry.value;
                 },
+                .max_concurrent_streams => session.peer_max_concurrent_streams = entry.value,
                 // Section 6.5.3: acknowledged whether or not we act on it, and
                 // section 6.5.2 requires an unrecognized identifier to be
                 // ignored rather than refused.
                 else => {},
             }
         }
-        try session.writeFrame(.settings, frame.Flag.ack.bit(), 0, &.{});
     }
 
     fn writeWindowUpdate(session: *Session, stream: u31, increment: u32) Error!void {
