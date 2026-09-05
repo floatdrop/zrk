@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 // table that lives on a connection's frame, so it is declared where that table
 // is rather than restated here.
 const connection = @import("connection.zig");
+const h3conn = @import("h3conn.zig");
 
 /// zrk version string, surfaced by `--version` and embedded in JSON reports.
 /// Single-sourced from build.zig.zon via the build's options module.
@@ -121,8 +122,20 @@ pub const Config = struct {
     /// otherwise, so `-c`, the pacing, and every latency number keep exactly
     /// their HTTP/1.1 meaning; only the wire format changes.
     http2: bool = false,
+    /// Speak HTTP/3 over QUIC instead of HTTP/1.1 or HTTP/2.
+    ///
+    /// Always TLS — QUIC has no cleartext mode — and always ALPN `h3`. `-c`,
+    /// the pacing and every latency number keep exactly their meaning from the
+    /// other two transports; `--streams` means what it means under `--http2`,
+    /// and is bounded by `h3conn.requests_max` rather than by
+    /// `connection.streams_max`.
+    ///
+    /// A prototype (zoxy-io/zrk#74). It requires `--insecure` because the QUIC
+    /// TLS engine does not verify certificates yet; see `src/quic_tls.zig` for
+    /// what is missing and how much of it there is.
+    http3: bool = false,
     /// How many of a connection's scheduled sends may be on the wire at once
-    /// (`-s/--streams`). Requires `--http2`.
+    /// (`-s/--streams`). Requires `--http2` or `--http3`.
     ///
     /// A depth knob, not a second concurrency dial: `-c` still divides `-R`,
     /// and `-c 10 -s 10` is deliberately *not* `-c 100` — same offered rate,
@@ -193,6 +206,10 @@ pub const ParseError = error{
     ZeroStreams,
     StreamsWithoutHttp2,
     TooManyStreams,
+    Http3WithHttp2,
+    Http3WithoutTls,
+    Http3WithoutInsecure,
+    Http3BodyTooLarge,
     OutOfMemory,
 };
 
@@ -222,11 +239,11 @@ pub const usage =
     \\Options:
     \\  -t, --threads     <N>     Total number of threads to execute load (default 2)
     \\  -c, --connections <N>     Total connections to keep open (default 10)
-    \\  -s, --streams     <N>     HTTP/2 streams in flight per connection
-    \\                            (default 1). A depth knob only: -R still
-    \\                            splits across -c, so -c 10 -s 10 offers the
-    \\                            same rate as -c 10, not as -c 100. Requires
-    \\                            --http2
+    \\  -s, --streams     <N>     HTTP/2 or HTTP/3 streams in flight per
+    \\                            connection (default 1). A depth knob only:
+    \\                            -R still splits across -c, so -c 10 -s 10
+    \\                            offers the same rate as -c 10, not as
+    \\                            -c 100. Requires --http2 or --http3
     \\  -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
     \\  -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps
     \\                            linearly from A to B over the run (default 1000)
@@ -261,6 +278,9 @@ pub const usage =
     \\      --http2               Speak HTTP/2. Cleartext uses prior knowledge
     \\                            (h2c); https negotiates it over ALPN and
     \\                            fails the connection if the server declines
+    \\      --http3               Speak HTTP/3 over QUIC (https only).
+    \\                            Prototype: the QUIC TLS engine does not
+    \\                            verify certificates yet, so it requires -k
     \\  -k, --insecure            Skip TLS certificate verification
     \\      --plain               Append-only output instead of a live dashboard
     \\
@@ -326,6 +346,8 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
             cfg.latency = true;
         } else if (eq(arg, "--http2") or eq(arg, "--h2c")) {
             cfg.http2 = true;
+        } else if (eq(arg, "--http3") or eq(arg, "--h3")) {
+            cfg.http3 = true;
         } else if (eq(arg, "-k") or eq(arg, "--insecure")) {
             cfg.insecure = true;
         } else if (eq(arg, "--plain") or eq(arg, "--no-tui")) {
@@ -420,19 +442,42 @@ pub fn parse(arena: Allocator, args: []const []const u8) ParseError!Parsed {
     // malformed field in h2 (RFC 9113 section 8.2.2 — which is why
     // `buildRequestBlock` omits it), and one stream per connection would
     // measure the handshake rather than the protocol.
-    if (cfg.disable_keepalive and cfg.http2) return error.KeepaliveWithHttp2;
+    if (cfg.disable_keepalive and (cfg.http2 or cfg.http3)) return error.KeepaliveWithHttp2;
+    // One wire format per run. They are not layered — HTTP/3 is a different
+    // transport, not a different framing over the same socket — so a run that
+    // asked for both asked for a comparison, and the way to get one is two runs.
+    if (cfg.http2 and cfg.http3) return error.Http3WithHttp2;
     if (cfg.streams == 0) return error.ZeroStreams;
     // HTTP/1.1 has no second stream to open. h2load spends `-m` on pipelining
     // there; zrk will not, because a pipelined depth cannot be aborted per
     // request — a timeout on one request abandons the whole pipeline behind
     // it, which is the very thing `--streams` exists to avoid.
-    if (cfg.streams > 1 and !cfg.http2) return error.StreamsWithoutHttp2;
+    if (cfg.streams > 1 and !cfg.http2 and !cfg.http3) return error.StreamsWithoutHttp2;
     // The slot table lives on the connection's own frame; see
-    // `connection.streams_max`.
-    if (cfg.streams > connection.streams_max) return error.TooManyStreams;
+    // `connection.streams_max`. Under HTTP/3 it is `h3conn`'s, and the smaller
+    // of the two, because a QUIC stream costs two flow-control windows sized at
+    // comptime where an HTTP/2 stream costs a `Slot`.
+    const streams_ceiling = if (cfg.http3) h3conn.requests_max else connection.streams_max;
+    if (cfg.streams > streams_ceiling) return error.TooManyStreams;
 
     const raw_url = url_arg orelse return error.MissingUrl;
     cfg.url = try parseUrl(raw_url);
+
+    if (cfg.http3) {
+        // QUIC has no cleartext mode: RFC 9114 §3.1 reaches an origin over TLS
+        // or not at all, so an `http://` target is a request this transport
+        // cannot answer rather than one it declines to.
+        if (!cfg.url.isTls()) return error.Http3WithoutTls;
+        // The prototype's one hard gate. `quic_tls.zig` proves the peer speaks
+        // QUIC, not who it is, and a load generator that silently skipped
+        // verification would be a worse thing than one that says so.
+        if (!cfg.insecure) return error.Http3WithoutInsecure;
+        // The request has to fit one `Connection.write`, because a short write
+        // is a failed request rather than one this file resumes. Checked here,
+        // against the real bound, so an oversized `--body` is a usage error
+        // before the run rather than a wall of write errors during it.
+        if (cfg.body.len >= h3conn.request_octets_max) return error.Http3BodyTooLarge;
+    }
 
     cfg.headers = try headers.toOwnedSlice(arena);
     return .{ .config = cfg };
@@ -713,6 +758,66 @@ test "streams flag parses; requires --http2 and a sane depth" {
     try testing.expectEqual(@as(u32, 4), with_closed.streams);
 }
 
+test "http3 parses, and its three preconditions are usage errors" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const cfg = (try parse(a, &[_][]const u8{ "--http3", "-k", "https://x/" })).config;
+    try testing.expect(cfg.http3);
+    try testing.expect(!cfg.http2);
+    // `--h3` is the short spelling, the way `--h2c` is HTTP/2's.
+    const short = (try parse(a, &[_][]const u8{ "--h3", "-k", "https://x/" })).config;
+    try testing.expect(short.http3);
+
+    // QUIC has no cleartext mode, so an http:// target is refused rather than
+    // silently downgraded.
+    try testing.expectError(error.Http3WithoutTls, parse(a, &[_][]const u8{ "--http3", "-k", "http://x/" }));
+    // The prototype's certificate gap, made impossible to run into unknowingly.
+    try testing.expectError(error.Http3WithoutInsecure, parse(a, &[_][]const u8{ "--http3", "https://x/" }));
+    // One wire format per run.
+    try testing.expectError(error.Http3WithHttp2, parse(a, &[_][]const u8{ "--http3", "--http2", "-k", "https://x/" }));
+}
+
+test "http3 takes --streams up to its own ceiling, which is not http2's" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const cfg = (try parse(a, &[_][]const u8{ "--http3", "-k", "-s", "8", "https://x/" })).config;
+    try testing.expectEqual(@as(u32, 8), cfg.streams);
+
+    // A QUIC stream costs two comptime-sized flow control windows where an
+    // HTTP/2 stream costs a slot, so the two ceilings are different numbers and
+    // the check has to read the right one.
+    try testing.expect(h3conn.requests_max < connection.streams_max);
+    const at_ceiling = try std.fmt.allocPrint(a, "{d}", .{h3conn.requests_max});
+    _ = (try parse(a, &[_][]const u8{ "--http3", "-k", "-s", at_ceiling, "https://x/" })).config;
+    const past_ceiling = try std.fmt.allocPrint(a, "{d}", .{h3conn.requests_max + 1});
+    try testing.expectError(
+        error.TooManyStreams,
+        parse(a, &[_][]const u8{ "--http3", "-k", "-s", past_ceiling, "https://x/" }),
+    );
+}
+
+test "a body that cannot fit one QUIC stream write is a usage error, not a run of failures" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const body = try a.alloc(u8, h3conn.request_octets_max);
+    @memset(body, 'x');
+    try testing.expectError(error.Http3BodyTooLarge, parse(
+        a,
+        &[_][]const u8{ "--http3", "-k", "-m", "POST", "-b", body, "https://x/" },
+    ));
+    // The same body is fine on the transports that do not have to fit it in one
+    // write, which is what makes this a property of `--http3` rather than a cap
+    // on `--body`.
+    const over_http2 = (try parse(a, &[_][]const u8{ "--http2", "-m", "POST", "-b", body, "https://x/" })).config;
+    try testing.expectEqual(h3conn.request_octets_max, over_http2.body.len);
+}
+
 test "disable-keepalive flag parses; rejects --http2" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -734,6 +839,12 @@ test "disable-keepalive flag parses; rejects --http2" {
     // h2 has no per-request connection to close, in either flag order.
     try testing.expectError(error.KeepaliveWithHttp2, parse(a, &[_][]const u8{ "--disable-keepalive", "--http2", "http://x/" }));
     try testing.expectError(error.KeepaliveWithHttp2, parse(a, &[_][]const u8{ "--http2", "--disable-keepalive", "http://x/" }));
+    // And HTTP/3, for the same reason: a stream is not a connection, so there
+    // is no per-request connection to close.
+    try testing.expectError(error.KeepaliveWithHttp2, parse(
+        a,
+        &[_][]const u8{ "--http3", "-k", "--disable-keepalive", "https://x/" },
+    ));
 }
 
 test "refresh flag parses and zero is rejected" {

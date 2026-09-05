@@ -44,6 +44,16 @@
             .url = "git+https://github.com/zoxy-io/zssl#b6a65537b394931b80dbdfa25ec7763b5837b7ae",
             .hash = "zssl-0.0.1-5ocyiNy-DgCb3DwVFeLhGK8x9olBEfyuRarEMDuMcIl8",
         },
+        // QUIC, QPACK and HTTP/3 — sans-I/O, like h2 and zssl. It opens no
+        // socket, reads no clock, draws no entropy and runs no TLS handshake:
+        // `src/h3conn.zig` supplies all four, and `src/quic_tls.zig` is the
+        // fourth because zssl declines QUIC (see its README, "Out, for now").
+        //
+        // A local path while this is a prototype. It becomes a pinned git URL
+        // the moment the shape stops moving.
+        .h3 = .{
+            .path = "../h3",
+        },
     },
     .paths = .{
         "build.zig",

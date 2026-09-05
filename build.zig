@@ -94,6 +94,16 @@ pub fn build(b: *std.Build) void {
     });
     const zssl_module = zssl.module("zssl");
 
+    // QUIC, QPACK and HTTP/3. `assertions = false` for the same reason h2 gets
+    // it above: h3's checks are on by default because zoxy points that code at
+    // the open internet, and zrk is a latency-measuring tool whose pitch is not
+    // injecting client-side noise into the measurement.
+    const h3 = b.dependency("h3", .{
+        .target = target,
+        .optimize = optimize,
+        .assertions = false,
+    });
+
     // Hung off each runnable artifact below rather than off the dependency,
     // so `zig build check` keeps working without a C toolchain.
     const libc_guard = nativeLibcGuard(b, target);
@@ -108,6 +118,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "h2", .module = h2.module("h2") },
             .{ .name = "zurl", .module = zurl.module("zurl") },
             .{ .name = "zssl", .module = zssl_module },
+            .{ .name = "h3", .module = h3.module("h3") },
         },
     });
     // `cli.zig` checks the README's usage block against the real help text.
@@ -145,6 +156,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "h2", .module = h2.module("h2") },
                 .{ .name = "zurl", .module = zurl.module("zurl") },
                 .{ .name = "zssl", .module = zssl_module },
+                .{ .name = "h3", .module = h3.module("h3") },
             },
         }),
     });
