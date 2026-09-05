@@ -15,6 +15,7 @@ const hdr = @import("hdr.zig");
 const httpmod = @import("http.zig");
 const tlsmod = @import("tls.zig");
 const h2conn = @import("h2conn.zig");
+const h3conn = @import("h3conn.zig");
 const pace = @import("pace.zig");
 const StatusClass = httpmod.StatusClass;
 
@@ -119,6 +120,18 @@ pub const Params = struct {
     body: []const u8 = &.{},
     /// Speak HTTP/2 with prior knowledge instead of HTTP/1.1.
     http2: bool = false,
+    /// Speak HTTP/3 over QUIC. Mutually exclusive with `http2`, and nothing
+    /// below this line in the TCP path runs: `run` hands the whole connection
+    /// to `h3conn.run`, which owns its own UDP socket, its own TLS handshake
+    /// and its own event loop. See that file for why it cannot be a codec swap.
+    http3: bool = false,
+    /// The same request as one QPACK-encoded HEADERS frame, plus a DATA frame
+    /// when there is a body, when `http3` is set.
+    ///
+    /// Built once at startup against QPACK's static table alone, so it depends
+    /// on no encoder state and is replayed byte-identically on every stream —
+    /// the HTTP/3 half of the trade `request_block` makes for HTTP/2.
+    h3_request: []const u8 = &.{},
     /// How many of this connection's scheduled sends may be on the wire at
     /// once (`--streams`). Requires `http2`.
     ///
@@ -184,6 +197,10 @@ pub const Params = struct {
     allocator: std.mem.Allocator = undefined,
     /// Pinned per-connection TLS buffers/client; required when `is_tls`.
     tls_state: ?*tlsmod.State = null,
+    /// Pinned per-connection QUIC/HTTP-3 transport state; required when
+    /// `http3`. Megabytes rather than kilobytes, and allocated once for the
+    /// run rather than per reconnect, for the same reason `tls_state` is.
+    h3_state: ?*h3conn.State = null,
     /// Shared trust store; null means verification is skipped.
     ca_store: ?*tlsmod.CaStore = null,
 };
@@ -195,6 +212,13 @@ const write_buffer_size = 8 * 1024;
 /// failures are folded into `counters` and recovered from by reconnecting.
 pub fn run(p: *Params) void {
     const io = p.io;
+
+    // HTTP/3 is not a codec swap. Everything below — the TCP connect, the
+    // reader/writer pair, the watchdog that enforces a bound by shutting a
+    // socket down — assumes a stream transport somebody else is running. QUIC
+    // is the transport, so `h3conn` owns the socket, the handshake and the
+    // clock, and this function's only part in it is the dispatch.
+    if (p.http3) return h3conn.run(p);
 
     var read_buf: [read_buffer_size]u8 = undefined;
     var write_buf: [write_buffer_size]u8 = undefined;
@@ -1202,20 +1226,20 @@ fn alpnIs(selected: ?[]const u8, want: []const u8) bool {
     return std.mem.eql(u8, chosen, want);
 }
 
-fn now(io: Io) Io.Timestamp {
+pub fn now(io: Io) Io.Timestamp {
     return Io.Timestamp.now(io, .awake);
 }
 
 /// Which socket-level counter a failure lands in. Named rather than anonymous
 /// because the multiplexed path decides the kind in one place and reports it in
 /// another.
-const ErrorKind = enum { connect, write, read };
+pub const ErrorKind = enum { connect, write, read };
 
 /// Record a socket error, unless we are shutting down — errors caused by
 /// cancelling in-flight I/O at end-of-test are artifacts, not real failures.
 /// Publishes so the live dashboard sees error-only periods (a total outage
 /// produces no successful responses to publish through).
-fn noteError(p: *Params, kind: ErrorKind) void {
+pub fn noteError(p: *Params, kind: ErrorKind) void {
     if (p.stop.load(.monotonic)) return;
     switch (kind) {
         .connect => p.counters.connect_errors += 1,
@@ -1230,7 +1254,7 @@ fn noteError(p: *Params, kind: ErrorKind) void {
 /// sample measured from the scheduled send time, so the tail reflects the stall
 /// instead of dropping the worst samples. Skipped during shutdown, where a
 /// timeout is a teardown artifact rather than a real failure.
-fn noteTimeout(p: *Params, io: Io, scheduled: Io.Timestamp) void {
+pub fn noteTimeout(p: *Params, io: Io, scheduled: Io.Timestamp) void {
     if (p.stop.load(.monotonic)) return;
     p.counters.timeouts += 1;
     const done = now(io);
@@ -1250,7 +1274,7 @@ fn noteTimeout(p: *Params, io: Io, scheduled: Io.Timestamp) void {
 /// latency sample — the histogram stays the distribution of requests served
 /// within the deadline. Skipped during shutdown, where it would be a teardown
 /// artifact rather than a real miss.
-fn noteDeadline(p: *Params) void {
+pub fn noteDeadline(p: *Params) void {
     if (p.stop.load(.monotonic)) return;
     p.counters.deadline_errors += 1;
     maybePublish(p, now(p.io).nanoseconds);
@@ -1264,7 +1288,7 @@ fn noteDeadline(p: *Params) void {
 /// counts advance in conns-sized steps, a staircase in the throughput
 /// timeseries. The histogram copy — the expensive part — still happens at
 /// most once per publish interval.
-fn maybePublish(p: *Params, now_ns: i128) void {
+pub fn maybePublish(p: *Params, now_ns: i128) void {
     const pub_ptr = p.publish orelse return;
     pub_ptr.mutex.lockUncancelable(p.io);
     defer pub_ptr.mutex.unlock(p.io);

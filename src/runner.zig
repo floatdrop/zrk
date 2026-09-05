@@ -10,6 +10,7 @@ const net = std.Io.net;
 
 const cli = @import("cli.zig");
 const connection = @import("connection.zig");
+const h3conn = @import("h3conn.zig");
 const httpmod = @import("http.zig");
 const pace = @import("pace.zig");
 const stats = @import("stats.zig");
@@ -106,12 +107,21 @@ pub fn run(
     // no encoder state, so replaying the same octets on every stream of every
     // connection is byte-identical to encoding it each time.
     const request_block = if (cfg.http2) try httpmod.buildRequestBlock(arena, cfg) else &[_]u8{};
+    // The HTTP/3 half of the same trade: one QPACK HEADERS frame (and a DATA
+    // frame when there is a body), built once and replayed byte-identically on
+    // every stream of every connection. See `h3conn.buildRequest`.
+    const h3_request = if (cfg.http3) try h3conn.buildRequest(arena, cfg) else &[_]u8{};
     const address = try resolveAddress(io, cfg.url.host, cfg.url.port);
 
     // Load the system trust store once (shared, read-mostly) for HTTPS
     // with verification enabled.
+    //
+    // Not for `--http3`: that path terminates TLS through `quic_tls.zig`,
+    // which does not verify certificates at all — which is why `cli.zig`
+    // requires `--insecure` for it, so this branch is unreachable there rather
+    // than merely unused.
     var ca_store: ?tlsmod.CaStore = null;
-    if (cfg.url.isTls() and !cfg.insecure) {
+    if (cfg.url.isTls() and !cfg.insecure and !cfg.http3) {
         ca_store = try tlsmod.CaStore.load(arena, io);
     }
     const ca_ptr: ?*tlsmod.CaStore = if (ca_store) |*c| c else null;
@@ -123,7 +133,15 @@ pub fn run(
     // repaints every frame but the numbers behind it are only as fresh as the
     // last publish.
     const publish_ns = if (frame_interval_ns > 0) @min(frame_interval_ns, cfg.interval_ns) else cfg.interval_ns;
-    var fleet = try stats.Fleet.init(arena, cfg.connections, publish_ns, cfg.url.isTls());
+    // `enable_tls` is zssl's per-connection block, which the HTTP/3 path does
+    // not use: QUIC's handshake state lives inside `h3conn.State` instead.
+    var fleet = try stats.Fleet.init(
+        arena,
+        cfg.connections,
+        publish_ns,
+        cfg.url.isTls() and !cfg.http3,
+        cfg.http3,
+    );
     defer fleet.deinit();
 
     // Merging the fleet's per-connection histograms is O(connections) and does
@@ -158,6 +176,8 @@ pub fn run(
         .request_block = request_block,
         .body = cfg.body,
         .http2 = cfg.http2,
+        .http3 = cfg.http3,
+        .h3_request = h3_request,
         .streams = cfg.streams,
         .method = .of(cfg.method),
         .is_tls = cfg.url.isTls(),

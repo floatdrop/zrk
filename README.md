@@ -59,11 +59,11 @@ Usage: zrk [options] <url>
 Options:
   -t, --threads     <N>     Total number of threads to execute load (default 2)
   -c, --connections <N>     Total connections to keep open (default 10)
-  -s, --streams     <N>     HTTP/2 streams in flight per connection
-                            (default 1). A depth knob only: -R still
-                            splits across -c, so -c 10 -s 10 offers the
-                            same rate as -c 10, not as -c 100. Requires
-                            --http2
+  -s, --streams     <N>     HTTP/2 or HTTP/3 streams in flight per
+                            connection (default 1). A depth knob only:
+                            -R still splits across -c, so -c 10 -s 10
+                            offers the same rate as -c 10, not as
+                            -c 100. Requires --http2 or --http3
   -d, --duration    <T>     Test duration, e.g. 30s, 2m    (default 10s)
   -R, --rate      <N|A:B>   Target requests/second (total); A:B ramps
                             linearly from A to B over the run (default 1000)
@@ -98,6 +98,9 @@ Options:
       --http2               Speak HTTP/2. Cleartext uses prior knowledge
                             (h2c); https negotiates it over ALPN and
                             fails the connection if the server declines
+      --http3               Speak HTTP/3 over QUIC (https only).
+                            Prototype: the QUIC TLS engine does not
+                            verify certificates yet, so it requires -k
   -k, --insecure            Skip TLS certificate verification
       --plain               Append-only output instead of a live dashboard
 
@@ -149,6 +152,9 @@ zrk -c20 -d1m -R500 --latency https://api.example.com/health
 zrk -c10 -R100 -m POST -b '{"ping":1}' \
     -H 'Content-Type: application/json' http://127.0.0.1:8080/echo
 
+# HTTP/3 over QUIC (prototype — see "HTTP/3" below for what that costs you)
+zrk --http3 -k -c10 -R500 -d30s https://127.0.0.1:4433/
+
 # CI-friendly, no redrawing dashboard
 zrk -c50 -R1000 -d20s --plain http://127.0.0.1:8080/ | tee run.log
 
@@ -164,6 +170,44 @@ zrk -c50 -R1000 -d20s --format json -o result.json \
 zrk -c50 -R1000 -d5m --timeseries - http://127.0.0.1:8080/ \
   | jplot achieved_rate+target_rate latency_us.p50+latency_us.p90+latency_us.p99 error_rate
 ```
+
+### HTTP/3
+
+`--http3` speaks HTTP/3 over QUIC through
+[h3](https://github.com/zoxy-io/h3), and is a **prototype**
+([#74](https://github.com/zoxy-io/zrk/issues/74)). It works, and the latency it
+reports means what every other transport's does — the coordinated-omission
+correction, `--deadline` shedding and the backlog gauge are the same code
+reading the same clock — but two things are worth knowing before quoting a
+number from it:
+
+- **It does not verify certificates**, so it requires `-k/--insecure` rather
+  than letting a run believe otherwise. QUIC needs a TLS engine that speaks RFC
+  9001's handshake rather than a record layer, and zssl declines QUIC, so this
+  path uses its own small client (`src/quic_tls.zig`) which parses the
+  certificate chain only far enough to keep the transcript honest. Deliberate
+  rather than pending: a load generator is pointed at a target its operator
+  chose. HTTP/1.1 and HTTP/2 still verify by default, and `-k` there is still
+  opt-in, so the case where that is not enough is covered on the transports
+  that can cover it.
+- **One datagram per syscall**, which bounds throughput per core and nothing
+  else. [#76](https://github.com/zoxy-io/zrk/issues/76) is the work, and it is
+  larger than the API surface suggests: `std.Io.net.Socket` has `sendMany` and
+  `receiveManyTimeout`, but zio implements the first as a loop over `sendmsg`
+  and the second one `recvmsg` at a time, and nothing in the stack exposes
+  `UDP_SEGMENT` or `UDP_GRO`. The batched API is there; the batching is not.
+
+Everything else carries over: `--closed`, ramps, `--timeseries`, the JSON
+summary and the CI gates all work unchanged.
+
+`--streams` works here as it does under `--http2`, and getting it there found a
+defect in h3: a multiplexed connection ran at full rate for about a second and
+then went to zero req/s, reporting no errors, because acknowledged packet
+contexts were truncated at thirty-two and the streams past that were never
+settled. It is fixed, and `build.zig.zon` pins the commit that fixes it —
+`src/h3conn.zig`'s module comment has the diagnosis. A `-c 16 -s 16 --closed`
+soak now runs 296,866 requests at 14.8k req/s where it previously managed
+1,642 before stalling.
 
 ### Exit codes
 

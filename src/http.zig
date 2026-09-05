@@ -74,6 +74,77 @@ pub fn buildRequest(allocator: std.mem.Allocator, cfg: *const cli.Config) ![]u8 
     return alloc_writer.toOwnedSlice();
 }
 
+/// One request field, in the form both HPACK and QPACK take it.
+///
+/// A local type rather than either encoder's. h2 vendors its own HPACK and h3
+/// depends on zoxy-io/hpack, so `h2.hpack.Field` and `h3.qpack.Field` are
+/// distinct nominal types of identical shape — and the rules that decide
+/// *which* fields zrk's request carries are not rules to write twice. They are
+/// written once, here, and each transport maps this list into its own encoder's
+/// type at the last moment.
+pub const Field = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// The field list zrk's request is, for either of the two transports that take
+/// one. Every string it points at is allocated in `scratch`, which the caller
+/// owns; the encoders copy the octets in, so the list dies with the encode.
+///
+/// Validated here rather than by each caller: a malformed request would be
+/// answered with a stream error on every single stream, and the run would
+/// report the target failing when it was us.
+pub fn buildRequestFields(scratch: std.mem.Allocator, cfg: *const cli.Config) ![]const Field {
+    var fields: std.ArrayList(Field) = .empty;
+
+    // RFC 9113 §8.3 and RFC 9114 §4.3.1 name the same four, and they come first.
+    try fields.append(scratch, .{ .name = ":method", .value = cfg.method });
+    try fields.append(scratch, .{ .name = ":scheme", .value = if (cfg.url.isTls()) "https" else "http" });
+    try fields.append(scratch, .{ .name = ":path", .value = cfg.url.target });
+
+    // §8.3.1: `:authority` replaces `Host`, and carries the port only when it
+    // is not the scheme's default — the same rule `buildRequest` applies to
+    // `Host`, so every transport addresses the same origin.
+    const default_port: u16 = if (cfg.url.isTls()) 443 else 80;
+    const authority = if (cfg.url.port == default_port)
+        try scratch.dupe(u8, cfg.url.host)
+    else
+        try std.fmt.allocPrint(scratch, "{s}:{d}", .{ cfg.url.host, cfg.url.port });
+    try fields.append(scratch, .{ .name = ":authority", .value = authority });
+
+    var has_ua = false;
+    var has_cl = false;
+    for (cfg.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) has_ua = true;
+        if (std.ascii.eqlIgnoreCase(h.name, "content-length")) has_cl = true;
+        // §8.2.1 requires field names to be lowercase on the wire. `-H` takes
+        // them in whatever case the user typed, exactly as HTTP/1.1 does, so
+        // the case is folded here rather than refused — the user asked for a
+        // header, not for a lesson.
+        try fields.append(scratch, .{
+            .name = try lowerName(scratch, h.name),
+            .value = h.value,
+        });
+    }
+    if (!has_ua) try fields.append(scratch, .{ .name = "user-agent", .value = "zrk" });
+
+    // No `Connection: keep-alive`: §8.2.2 makes connection-specific header
+    // fields malformed above HTTP/1.1, and `buildRequest` adds one.
+    if (!has_cl) {
+        if (cfg.body.len > 0) {
+            try fields.append(scratch, .{
+                .name = "content-length",
+                .value = try std.fmt.allocPrint(scratch, "{d}", .{cfg.body.len}),
+            });
+        } else if (methodAnticipatesBody(cfg.method)) {
+            try fields.append(scratch, .{ .name = "content-length", .value = "0" });
+        }
+    }
+
+    try validateRequestFields(fields.items);
+    return fields.items;
+}
+
 /// The HTTP/2 request as one HPACK-encoded header block, built once.
 ///
 /// Encoded with `Encoder.Mode.static_only`, which is an API guarantee in
@@ -92,59 +163,13 @@ pub fn buildRequestBlock(allocator: std.mem.Allocator, cfg: *const cli.Config) !
     defer scratch.deinit();
     const tmp = scratch.allocator();
 
-    var fields: std.ArrayList(h2.hpack.Field) = .empty;
+    const fields = try buildRequestFields(tmp, cfg);
 
-    // RFC 9113 §8.3: the pseudo-header fields, and they come first.
-    try fields.append(tmp, .{ .name = ":method", .value = cfg.method });
-    try fields.append(tmp, .{ .name = ":scheme", .value = if (cfg.url.isTls()) "https" else "http" });
-    try fields.append(tmp, .{ .name = ":path", .value = cfg.url.target });
+    // Into h2's own field type at the last moment; see `Field`.
+    const hpack_fields = try tmp.alloc(h2.hpack.Field, fields.len);
+    for (hpack_fields, fields) |*out, in| out.* = .{ .name = in.name, .value = in.value };
 
-    // §8.3.1: `:authority` replaces `Host`, and carries the port only when it
-    // is not the scheme's default — the same rule `buildRequest` applies to
-    // `Host`, so the two transports address the same origin.
-    const default_port: u16 = if (cfg.url.isTls()) 443 else 80;
-    const authority = if (cfg.url.port == default_port)
-        try tmp.dupe(u8, cfg.url.host)
-    else
-        try std.fmt.allocPrint(tmp, "{s}:{d}", .{ cfg.url.host, cfg.url.port });
-    try fields.append(tmp, .{ .name = ":authority", .value = authority });
-
-    var has_ua = false;
-    var has_cl = false;
-    for (cfg.headers) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) has_ua = true;
-        if (std.ascii.eqlIgnoreCase(h.name, "content-length")) has_cl = true;
-        // §8.2.1 requires field names to be lowercase on the wire. `-H` takes
-        // them in whatever case the user typed, exactly as HTTP/1.1 does, so
-        // the case is folded here rather than refused — the user asked for a
-        // header, not for a lesson.
-        try fields.append(tmp, .{
-            .name = try lowerName(tmp, h.name),
-            .value = h.value,
-        });
-    }
-    if (!has_ua) try fields.append(tmp, .{ .name = "user-agent", .value = "zrk" });
-
-    // No `Connection: keep-alive`: §8.2.2 makes connection-specific header
-    // fields malformed in HTTP/2, and `buildRequest` adds one.
-    if (!has_cl) {
-        if (cfg.body.len > 0) {
-            try fields.append(tmp, .{
-                .name = "content-length",
-                .value = try std.fmt.allocPrint(tmp, "{d}", .{cfg.body.len}),
-            });
-        } else if (methodAnticipatesBody(cfg.method)) {
-            try fields.append(tmp, .{ .name = "content-length", .value = "0" });
-        }
-    }
-
-    // Checked before it goes on the wire, once, for the block that will be sent
-    // for the whole run. A malformed request would be answered with a stream
-    // error on every single stream, and the run would report the target
-    // failing when it was us.
-    try validateRequestFields(fields.items);
-
-    return encodeBlock(allocator, fields.items);
+    return encodeBlock(allocator, hpack_fields);
 }
 
 /// Encode into a buffer sized from the fields themselves.
@@ -181,7 +206,7 @@ fn lowerName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
 
 /// The request has to be a well-formed HTTP/2 request before it is sent a
 /// million times.
-fn validateRequestFields(fields: []const h2.hpack.Field) !void {
+fn validateRequestFields(fields: []const Field) !void {
     var validator: h2.fields.MessageValidator = .init(.{
         .kind = .request,
         // The stricter reading for what *we* send. zrk is lenient about what a
@@ -189,8 +214,13 @@ fn validateRequestFields(fields: []const h2.hpack.Field) !void {
         // request it generates itself has no excuse for being questionable.
         .rules = .strict,
     });
+    // h2's validator for the HTTP/3 request too. RFC 9114 §4.3 restates RFC
+    // 9113 §8.3's rules for the same four pseudo-headers, so one validator
+    // answers for both — and it is the request *this program builds*, not
+    // anything a peer sent, so the two readings cannot diverge on real input.
     for (fields) |field| {
-        validator.field(&field) catch return error.InvalidRequestHeader;
+        const one: h2.hpack.Field = .{ .name = field.name, .value = field.value };
+        validator.field(&one) catch return error.InvalidRequestHeader;
     }
     validator.finish() catch return error.InvalidRequestHeader;
 }

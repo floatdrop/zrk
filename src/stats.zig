@@ -15,6 +15,7 @@ const Allocator = std.mem.Allocator;
 
 const hdr = @import("hdr.zig");
 const connection = @import("connection.zig");
+const h3conn = @import("h3conn.zig");
 const tlsmod = @import("tls.zig");
 
 /// Latency histogram configuration: 1µs .. 60s at 3 significant figures.
@@ -61,8 +62,19 @@ pub const Fleet = struct {
     params: []connection.Params,
     /// Per-connection TLS state, allocated only for HTTPS targets.
     tls_state: ?[]tlsmod.State,
+    /// Per-connection QUIC/HTTP-3 transport state, allocated only for
+    /// `--http3`. Megabytes apiece rather than kilobytes — see
+    /// `h3conn.footprint_octets` — which is exactly why it is allocated here,
+    /// once for the run, and not on a coroutine's frame per reconnect.
+    h3_state: ?[]h3conn.State,
 
-    pub fn init(allocator: Allocator, n: u32, publish_interval_ns: u64, enable_tls: bool) !Fleet {
+    pub fn init(
+        allocator: Allocator,
+        n: u32,
+        publish_interval_ns: u64,
+        enable_tls: bool,
+        enable_h3: bool,
+    ) !Fleet {
         const live_hist = try allocator.alloc(hdr.Histogram, n);
         errdefer allocator.free(live_hist);
         const live_counters = try allocator.alloc(connection.Counters, n);
@@ -79,6 +91,11 @@ pub const Fleet = struct {
         // decide whether a previous session needs tearing down, so nothing may
         // touch one before this runs.
         if (tls_state) |ts| for (ts) |*state| state.init();
+        const h3_state: ?[]h3conn.State = if (enable_h3) try allocator.alloc(h3conn.State, n) else null;
+        errdefer if (h3_state) |hs| allocator.free(hs);
+        // Same contract as `tls_state` above: the block arrives undefined and
+        // nothing may read a field before this runs.
+        if (h3_state) |hs| for (hs) |*state| state.init();
 
         var live_inited: usize = 0;
         errdefer for (live_hist[0..live_inited]) |*h| h.deinit();
@@ -106,6 +123,7 @@ pub const Fleet = struct {
             .publish = publish,
             .params = params,
             .tls_state = tls_state,
+            .h3_state = h3_state,
         };
     }
 
@@ -126,6 +144,7 @@ pub const Fleet = struct {
             p.publish = &self.publish[i];
             p.phase = @as(f64, @floatFromInt(i)) / n;
             if (self.tls_state) |ts| p.tls_state = &ts[i];
+            if (self.h3_state) |hs| p.h3_state = &hs[i];
         }
         return self.params;
     }
@@ -170,6 +189,9 @@ pub const Fleet = struct {
             for (ts) |*state| state.deinit();
             self.allocator.free(ts);
         }
+        // Nothing to tear down per state: `h3conn.State` owns no handle and no
+        // allocation — the transport's whole memory is the block itself.
+        if (self.h3_state) |hs| self.allocator.free(hs);
     }
 };
 
@@ -312,7 +334,7 @@ test "the default histogram's footprint stays within budget" {
 }
 
 test "fleet aggregates live counters and histograms" {
-    var fleet = try Fleet.init(testing.allocator, 3, std.time.ns_per_s, false);
+    var fleet = try Fleet.init(testing.allocator, 3, std.time.ns_per_s, false, false);
     defer fleet.deinit();
 
     // Simulate each connection having done some work.
@@ -334,7 +356,7 @@ test "fleet aggregates live counters and histograms" {
 test "Fleet.init leaks nothing when any allocation fails" {
     try testing.checkAllAllocationFailures(testing.allocator, struct {
         fn initAndDeinit(allocator: Allocator) !void {
-            var fleet = try Fleet.init(allocator, 3, std.time.ns_per_s, true);
+            var fleet = try Fleet.init(allocator, 3, std.time.ns_per_s, true, false);
             fleet.deinit();
         }
     }.initAndDeinit, .{});
@@ -345,7 +367,7 @@ test "readSnapshot reflects published state" {
     defer rt.deinit();
     const io = rt.io();
 
-    var fleet = try Fleet.init(testing.allocator, 2, std.time.ns_per_s, false);
+    var fleet = try Fleet.init(testing.allocator, 2, std.time.ns_per_s, false, false);
     defer fleet.deinit();
 
     // Publish some values into each connection's snapshot slot directly.
@@ -367,7 +389,7 @@ test "Sweeper returns the same aggregate as an inline readSnapshot" {
     defer rt.deinit();
     const io = rt.io();
 
-    var fleet = try Fleet.init(testing.allocator, 8, std.time.ns_per_s, false);
+    var fleet = try Fleet.init(testing.allocator, 8, std.time.ns_per_s, false, false);
     defer fleet.deinit();
     for (fleet.publish, 0..) |*p, i| {
         p.hist.record(1000 * (@as(u64, @intCast(i)) + 1));
@@ -403,7 +425,7 @@ test "each Sweeper.snapshot waits for a merge newer than the request" {
     defer rt.deinit();
     const io = rt.io();
 
-    var fleet = try Fleet.init(testing.allocator, 4, std.time.ns_per_s, false);
+    var fleet = try Fleet.init(testing.allocator, 4, std.time.ns_per_s, false, false);
     defer fleet.deinit();
 
     var sweeper = try Sweeper.init(testing.allocator, &fleet, io);
@@ -432,7 +454,7 @@ test "Sweeper stops cleanly when no snapshot was ever taken" {
     var rt = try zio.Runtime.init(testing.allocator, .{});
     defer rt.deinit();
 
-    var fleet = try Fleet.init(testing.allocator, 2, std.time.ns_per_s, false);
+    var fleet = try Fleet.init(testing.allocator, 2, std.time.ns_per_s, false, false);
     defer fleet.deinit();
 
     var sweeper = try Sweeper.init(testing.allocator, &fleet, rt.io());
