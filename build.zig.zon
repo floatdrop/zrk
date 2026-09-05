@@ -49,10 +49,14 @@
         // `src/h3conn.zig` supplies all four, and `src/quic_tls.zig` is the
         // fourth because zssl declines QUIC (see its README, "Out, for now").
         //
-        // A local path while this is a prototype. It becomes a pinned git URL
-        // the moment the shape stops moving.
+        // Pinned at the commit that fixes the acknowledgement-report
+        // truncation this prototype found: below it, a connection carrying
+        // more than one stream strands them once the congestion window grows
+        // past thirty-two packets. `src/h3conn.zig` has the diagnosis.
+        //
         .h3 = .{
-            .path = "../h3",
+            .url = "git+https://github.com/zoxy-io/h3#3accaf4b8d35d299315927296c0bc49b5f5ffc3a",
+            .hash = "h3-0.0.0-RBkp8tYDFwAKtZHosUA5okrC2lg9y6gFkh4BZvmtvZSI",
         },
     },
     .paths = .{

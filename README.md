@@ -178,7 +178,7 @@ zrk -c50 -R1000 -d5m --timeseries - http://127.0.0.1:8080/ \
 ([#74](https://github.com/zoxy-io/zrk/issues/74)). It works, and the latency it
 reports means what every other transport's does — the coordinated-omission
 correction, `--deadline` shedding and the backlog gauge are the same code
-reading the same clock — but three things are worth knowing before quoting a
+reading the same clock — but two things are worth knowing before quoting a
 number from it:
 
 - **It does not verify certificates**, so it requires `-k/--insecure` rather
@@ -187,13 +187,6 @@ number from it:
   path uses its own small client (`src/quic_tls.zig`) which parses the
   certificate chain only far enough to keep the transcript honest. Closing that
   is bounded, known work, and the file says exactly what is missing.
-- **`--streams` needs h3 at or past the acknowledgement-report fix.** Soaking
-  this path found a defect upstream that stranded streams once the congestion
-  window grew — a multiplexed connection ran at full rate for about a second and
-  then went to zero req/s with no errors. It is fixed; `src/h3conn.zig`'s module
-  comment has the diagnosis, and against a fixed h3 a `-c 16 -s 16 --closed`
-  soak runs 296,866 requests at 14.8k req/s with no errors where it previously
-  managed 1,642.
 - **One datagram per syscall.** No GSO/GRO batching yet, which is the thing
   [#74](https://github.com/zoxy-io/zrk/issues/74) names as deciding whether an
   HTTP/3 load generator can saturate a link. `std.Io.net.Socket` already
@@ -202,6 +195,15 @@ number from it:
 
 Everything else carries over: `--closed`, ramps, `--timeseries`, the JSON
 summary and the CI gates all work unchanged.
+
+`--streams` works here as it does under `--http2`, and getting it there found a
+defect in h3: a multiplexed connection ran at full rate for about a second and
+then went to zero req/s, reporting no errors, because acknowledged packet
+contexts were truncated at thirty-two and the streams past that were never
+settled. It is fixed, and `build.zig.zon` pins the commit that fixes it —
+`src/h3conn.zig`'s module comment has the diagnosis. A `-c 16 -s 16 --closed`
+soak now runs 296,866 requests at 14.8k req/s where it previously managed
+1,642 before stalling.
 
 ### Exit codes
 
