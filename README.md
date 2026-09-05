@@ -185,13 +185,17 @@ number from it:
   than letting a run believe otherwise. QUIC needs a TLS engine that speaks RFC
   9001's handshake rather than a record layer, and zssl declines QUIC, so this
   path uses its own small client (`src/quic_tls.zig`) which parses the
-  certificate chain only far enough to keep the transcript honest. Closing that
-  is bounded, known work, and the file says exactly what is missing.
-- **One datagram per syscall.** No GSO/GRO batching yet, which is the thing
-  [#74](https://github.com/zoxy-io/zrk/issues/74) names as deciding whether an
-  HTTP/3 load generator can saturate a link. `std.Io.net.Socket` already
-  exposes the batched calls and zio implements them, so this is measurement
-  work rather than plumbing.
+  certificate chain only far enough to keep the transcript honest. Deliberate
+  rather than pending: a load generator is pointed at a target its operator
+  chose. HTTP/1.1 and HTTP/2 still verify by default, and `-k` there is still
+  opt-in, so the case where that is not enough is covered on the transports
+  that can cover it.
+- **One datagram per syscall**, which bounds throughput per core and nothing
+  else. [#76](https://github.com/zoxy-io/zrk/issues/76) is the work, and it is
+  larger than the API surface suggests: `std.Io.net.Socket` has `sendMany` and
+  `receiveManyTimeout`, but zio implements the first as a loop over `sendmsg`
+  and the second one `recvmsg` at a time, and nothing in the stack exposes
+  `UDP_SEGMENT` or `UDP_GRO`. The batched API is there; the batching is not.
 
 Everything else carries over: `--closed`, ramps, `--timeseries`, the JSON
 summary and the CI gates all work unchanged.

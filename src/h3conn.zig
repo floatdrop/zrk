@@ -38,12 +38,18 @@
 //!
 //! * **No certificate verification.** `quic_tls.zig` says why, and `cli.zig`
 //!   makes `--http3` require `--insecure` so no run can believe otherwise.
-//! * **One datagram per syscall.** The issue that asked for HTTP/3
-//!   (zoxy-io/zrk#74) names GSO/GRO batching as the thing that decides whether
-//!   a load generator can saturate a link. `std.Io.net.Socket` has `sendMany`
-//!   and `receiveManyTimeout` and zio implements both, so the seam is there;
-//!   this file does not use it yet, and that is the first optimisation to
-//!   measure rather than assume.
+//!   Accepted rather than outstanding: a load generator is pointed at a target
+//!   its operator chose, and the other two transports keep verification on by
+//!   default for the case where that is not enough.
+//! * **One datagram per syscall** — `flush` calls `socket.send` once per
+//!   datagram and the loop below receives one per `receiveTimeout`.
+//!   zoxy-io/zrk#76 is the work, and it is larger than the API surface
+//!   suggests: `std.Io.net.Socket` has `sendMany` and `receiveManyTimeout`,
+//!   but zio implements the first as a `for` loop over `sendmsg` and the
+//!   second one `recvmsg` at a time, and nothing in the stack exposes
+//!   `UDP_SEGMENT` or `UDP_GRO`. So the batched *API* is here and the batching
+//!   is not, and closing that is plumbing in a dependency rather than a
+//!   call-site change in this file.
 //! * **No connection migration, no 0-RTT, no session resumption.** A run that
 //!   reconnects pays a full handshake every time.
 //!
