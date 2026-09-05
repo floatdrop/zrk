@@ -10,6 +10,15 @@ name: Release
 # packages, gathers and checksums exactly as a real release does, then stops
 # before publishing anything or touching the tap. Use it after editing this
 # file.
+#
+# A tag whose version carries a semver prerelease — `v3.0.0-alpha.1`, anything
+# with a `-` after the version — is published as a GitHub prerelease and does
+# **not** touch the Homebrew tap. The tap holds one formula and `brew upgrade`
+# reads it, so publishing an alpha there hands it to every stable user; and
+# `livecheck`'s `:github_latest` strategy skips prereleases, so a stable
+# formula left alone keeps pointing at the last stable release. Prereleases
+# ship as downloadable archives and nothing else, which is what a prerelease
+# is for.
 on:
   push:
     tags: ['v*']
@@ -37,14 +46,27 @@ jobs:
       tag: ${{ steps.ver.outputs.tag }}
       version: ${{ steps.ver.outputs.version }}
       dry: ${{ steps.ver.outputs.dry }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
     steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
       - name: Resolve version
         id: ver
         run: |
           set -euo pipefail
           ref="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${ref#v}"
           echo "tag=$ref" >> "$GITHUB_OUTPUT"
-          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Semver: everything after the first `-` is the prerelease
+          # identifier. `3.0.0` has none, `3.0.0-alpha.1` does.
+          case "$version" in
+            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT"
+                 echo "::notice::$ref is a prerelease — GitHub prerelease, no tap" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
           # On `push` there are no inputs at all, so this is empty and the
           # release is real. Only an explicit dispatch can ask for a dry run.
           # The publish steps gate on `dry == 'false'` rather than
@@ -57,6 +79,27 @@ jobs:
           else
             echo "dry=false" >> "$GITHUB_OUTPUT"
           fi
+
+      # The tag names the artifacts; build.zig.zon is what `zrk --version`
+      # prints. Nothing made the two agree, and until now one thing caught it
+      # late: the Homebrew formula's `assert_match version.to_s` against
+      # `zrk --version`, on install. A prerelease does not go to the tap, so
+      # that backstop is gone for exactly the releases most likely to be cut in
+      # a hurry — which is why the check moves here, before anything is built.
+      - name: Tag and manifest agree
+        run: |
+          set -euo pipefail
+          version="${{ steps.ver.outputs.version }}"
+          # The only `.version` in the file: a dependency entry carries a `.url`
+          # and a `.hash`, never a version.
+          manifest=$(sed -n 's/^[[:space:]]*\.version = "\(.*\)",$/\1/p' build.zig.zon | head -1)
+          [ -n "$manifest" ] || { echo "no .version in build.zig.zon"; exit 1; }
+          if [ "$manifest" != "$version" ]; then
+            echo "tag says $version, build.zig.zon says $manifest" >&2
+            echo "bump .version in build.zig.zon to match the tag" >&2
+            exit 1
+          fi
+          echo "tag and manifest agree on $version"
 
   # Zig cross-compiles any target from any host, so these could all run on one
   # runner — and did, serially, for 15 minutes. Each leg builds BoringSSL from
@@ -168,9 +211,18 @@ jobs:
           files: dist/*
           body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: ${{ steps.notes.outputs.generate }}
+          # GitHub declines to call a prerelease "Latest" on its own, so this
+          # one flag is also what keeps the README's "latest release binary"
+          # link, and the stable formula's `:github_latest` livecheck, pointing
+          # at the last stable release.
+          prerelease: ${{ needs.version.outputs.prerelease }}
 
+      # Not for a prerelease: the tap holds one formula, `brew upgrade` reads
+      # it, and an alpha written there is an alpha handed to every stable user.
+      # `zrk-alpha` as a second formula is the shape that would let both exist,
+      # and it is not built here — a prerelease ships as archives.
       - name: Update Homebrew formula
-        if: needs.version.outputs.dry == 'false'
+        if: needs.version.outputs.dry == 'false' && needs.version.outputs.prerelease == 'false'
         env:
           HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         run: |
@@ -258,7 +310,17 @@ jobs:
           count=$(grep -c '\.tar\.gz$' assets.txt)
           [ "$count" -eq 4 ] || { echo "expected 4 archives on $tag, found $count"; exit 1; }
           grep -qx 'SHA256SUMS.txt' assets.txt || { echo "no SHA256SUMS.txt on $tag"; exit 1; }
-          echo "$tag published with 4 archives and checksums"
+
+          # The same reasoning as the comment above, applied to the flag that
+          # decides who gets this build. `prerelease` is passed to an action
+          # rather than acted on here, so nothing else would notice it being
+          # dropped — and a prerelease published as a normal release is one
+          # `brew upgrade` away from being everyone's problem.
+          want="${{ needs.version.outputs.prerelease }}"
+          got=$(gh release view "$tag" --json isPrerelease --jq '.isPrerelease')
+          [ "$got" = "$want" ] || { echo "$tag: isPrerelease is $got, expected $want"; exit 1; }
+
+          echo "$tag published with 4 archives and checksums, prerelease=$got"
 
       - name: Dry run summary
         if: needs.version.outputs.dry == 'true'
