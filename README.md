@@ -32,6 +32,12 @@ A constant-throughput HTTP load generator — a Zig 0.16 rewrite of
 brew install zoxy-io/tap/zrk
 ```
 
+The tap follows stable releases only. A prerelease — `v3.0.0-alpha.1` and
+anything else with a `-` in its version — is published to
+[Releases](https://github.com/zoxy-io/zrk/releases) as archives and is
+deliberately not written to the tap, because the tap holds one formula and
+`brew upgrade` reads it. Take a prerelease from the download below.
+
 ### Pre-built binary
 
 Download the latest release binary from the [Releases page](https://github.com/zoxy-io/zrk/releases).
